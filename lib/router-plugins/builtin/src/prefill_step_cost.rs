@@ -14,22 +14,30 @@
 //!   uncached tokens `q` are the same on every rank unless a rank holds more on the GPU; cost is
 //!   `uncached * q + uncached_times_context * q * (cached + q / 2) + per_request`.
 //! - `load(r)`: time before the prompt can start when the rank must load the store prefix beyond
-//!   its device overlap, `load_fixed + load_per_token * load_tokens` (0 when the device holds the
-//!   whole cached prefix). Loading overlaps the rank's backlog, so the start time is
-//!   `max(load, backlog)`.
+//!   its device overlap (0 when the device holds the whole cached prefix). Loads of one worker
+//!   (node) share its store read bandwidth, so the transfer is charged at the worker's share:
+//!   `load_fixed + load_per_token * load_tokens + (load_state_bytes + load_bytes_per_token *
+//!   load_tokens) * (1 + worker_active_requests) / node_read_bandwidth`, where
+//!   `worker_active_requests` counts the router's active requests on every DP rank of that worker.
+//!   Loading overlaps the rank's backlog, so the start time is `max(load, backlog)`.
+//! - KV pressure: a rank whose active KV footprint plus this prompt exceeds `kv_capacity_blocks`
+//!   cannot admit it before other requests finish; such rows pay `kv_full_penalty`.
 //! - DP lockstep: ranks of a DP engine step together, so the busiest rank sets every step. Raising
 //!   a rank above the current busiest rank's backlog costs `balance_weight` times the excess.
 //!
 //! `cost(r) = max(load(r), backlog(r)) + request(r) + balance_weight * max(0, backlog(r) +
-//! request(r) - max_backlog)`. Ties resolve to the rank with fewer active requests.
+//! request(r) - max_backlog) + kv(r)`. Ties resolve to the rank with fewer active requests.
 //!
 //! With `store_retention_secs > 0` the policy also enables the router's global-prefix store model
 //! (blocks routed earlier to any worker are resident in the store for that long), which supplies
 //! the shared-store prefix and books store-resident tokens as cached.
 //!
 //! Coefficients default to the Kimi K3.1 DEP16 prefill fit on VR200 (step cost per rank: 0.0253
-//! ms/token, 1.03e-7 ms per token x context token, 18.7 ms per chunk; Mooncake load about 0.14 s +
-//! 19 KB/token at ~5 GB/s plus two lockstep steps of admission pipeline).
+//! ms/token, 1.03e-7 ms per token x context token, 18.7 ms per chunk; Mooncake load 1.15 s of
+//! lookup/admission pipeline plus 0.30 GB of recurrent state + 19 KB/token read at the worker's
+//! share of ~16 GB/s). The shared-bandwidth and KV-pressure terms follow the prefill-tier
+//! simulator: without them, loads pile onto one node's store reads and ranks with full KV keep
+//! receiving prompts they cannot admit.
 
 use std::sync::Arc;
 
@@ -60,8 +68,19 @@ struct Parameters {
     /// ms before a store load completes and the prompt is schedulable (lookup, transfer start,
     /// admission steps).
     load_fixed: f64,
-    /// ms per token loaded from the store.
+    /// ms per token loaded from the store, independent of bandwidth sharing.
     load_per_token: f64,
+    /// Bytes read per load besides the KV tokens (recurrent state checkpoints).
+    load_state_bytes: f64,
+    /// Bytes read per loaded KV token.
+    load_bytes_per_token: f64,
+    /// Store read bandwidth per worker (node) in GB/s, shared by that worker's active loads;
+    /// 0 drops the shared-bandwidth term.
+    node_read_gbps: f64,
+    /// Rank KV capacity in router blocks; 0 drops the KV-pressure term.
+    kv_capacity_blocks: f64,
+    /// ms added to a rank whose KV would overflow with this prompt.
+    kv_full_penalty: f64,
     /// Weight of the DP-lockstep excess over the busiest rank's backlog.
     balance_weight: f64,
     /// Store prefix retention in seconds; > 0 enables the router's global-prefix store model.
@@ -75,8 +94,13 @@ impl Default for Parameters {
             uncached_times_context: 1.03e-7,
             per_request: 18.7,
             backlog_context: 150_000.0,
-            load_fixed: 1_850.0,
-            load_per_token: 0.0038,
+            load_fixed: 1_150.0,
+            load_per_token: 0.0,
+            load_state_bytes: 0.30e9,
+            load_bytes_per_token: 19_000.0,
+            node_read_gbps: 16.0,
+            kv_capacity_blocks: 0.0,
+            kv_full_penalty: 5_000.0,
             balance_weight: 1.0,
             store_retention_secs: 0,
         }
@@ -92,6 +116,11 @@ impl Parameters {
             ("backlog_context", self.backlog_context),
             ("load_fixed", self.load_fixed),
             ("load_per_token", self.load_per_token),
+            ("load_state_bytes", self.load_state_bytes),
+            ("load_bytes_per_token", self.load_bytes_per_token),
+            ("node_read_gbps", self.node_read_gbps),
+            ("kv_capacity_blocks", self.kv_capacity_blocks),
+            ("kv_full_penalty", self.kv_full_penalty),
             ("balance_weight", self.balance_weight),
         ];
         for (name, value) in nonneg {
@@ -115,17 +144,23 @@ impl Parameters {
 /// The per-rank signals the policy uses.
 #[derive(Debug, Clone, Copy)]
 struct Rank {
+    /// Worker (node) id; DP ranks of one worker share its store read bandwidth.
+    worker_id: u64,
     device_overlap_blocks: f64,
     active_prefill_tokens: usize,
     active_requests: usize,
+    /// Active KV footprint in router blocks.
+    active_blocks: f64,
 }
 
 impl Rank {
-    fn from_inputs(cache: &WorkerCacheInput, load: &WorkerLoadInput) -> Self {
+    fn from_inputs(worker_id: u64, cache: &WorkerCacheInput, load: &WorkerLoadInput) -> Self {
         Self {
+            worker_id,
             device_overlap_blocks: cache.device_overlap_blocks(),
             active_prefill_tokens: load.active_prefill_tokens(),
             active_requests: load.active_requests(),
+            active_blocks: load.decode_cost_blocks(),
         }
     }
 }
@@ -141,6 +176,13 @@ fn row_costs(
     let backlog: Vec<f64> = ranks.iter().map(|r| parameters.backlog_ms(r)).collect();
     let max_backlog = backlog.iter().copied().fold(0.0, f64::max);
     let isl_f = isl as f64;
+    let mut worker_active: std::collections::HashMap<u64, usize> = std::collections::HashMap::new();
+    for rank in ranks {
+        *worker_active.entry(rank.worker_id).or_default() += rank.active_requests;
+    }
+    // bytes per ms at 1 GB/s = 1e6
+    let node_bytes_per_ms = parameters.node_read_gbps * 1e6;
+    let prompt_blocks = (isl_f / block_size.max(1) as f64).ceil();
     ranks
         .iter()
         .zip(&backlog)
@@ -154,12 +196,27 @@ fn row_costs(
                 + parameters.per_request;
             let load_tokens = (store - device).max(0.0);
             let load = if load_tokens > 0.0 {
-                parameters.load_fixed + parameters.load_per_token * load_tokens
+                let shared = if node_bytes_per_ms > 0.0 {
+                    let sharers = 1 + worker_active.get(&rank.worker_id).copied().unwrap_or(0);
+                    (parameters.load_state_bytes + parameters.load_bytes_per_token * load_tokens)
+                        * sharers as f64
+                        / node_bytes_per_ms
+                } else {
+                    0.0
+                };
+                parameters.load_fixed + parameters.load_per_token * load_tokens + shared
+            } else {
+                0.0
+            };
+            let kv = if parameters.kv_capacity_blocks > 0.0
+                && rank.active_blocks + prompt_blocks > parameters.kv_capacity_blocks
+            {
+                parameters.kv_full_penalty
             } else {
                 0.0
             };
             let excess = (backlog + request - max_backlog).max(0.0);
-            load.max(backlog) + request + parameters.balance_weight * excess
+            load.max(backlog) + request + parameters.balance_weight * excess + kv
         })
         .collect()
 }
@@ -195,10 +252,14 @@ impl WorkerPicker for PrefillStepCostPicker {
         if cache.is_empty() || cache.len() != load.len() {
             return Err(WorkerSelectionPolicyError::failed("no eligible worker"));
         }
-        let ranks: Vec<Rank> = cache
+        let ranks: Vec<Rank> = input
+            .candidates()
             .iter()
+            .zip(cache)
             .zip(load)
-            .map(|(cache, load)| Rank::from_inputs(cache, load))
+            .map(|((candidate, cache), load)| {
+                Rank::from_inputs(candidate.worker().worker_id, cache, load)
+            })
             .collect();
         let costs = row_costs(
             &self.parameters,
@@ -244,11 +305,69 @@ mod tests {
     const BS: u32 = 16384;
 
     fn rank(device_overlap_blocks: f64, active_prefill_tokens: usize, active_requests: usize) -> Rank {
+        rank_on(0, device_overlap_blocks, active_prefill_tokens, active_requests)
+    }
+
+    fn rank_on(
+        worker_id: u64,
+        device_overlap_blocks: f64,
+        active_prefill_tokens: usize,
+        active_requests: usize,
+    ) -> Rank {
         Rank {
+            worker_id,
             device_overlap_blocks,
             active_prefill_tokens,
             active_requests,
+            active_blocks: 0.0,
         }
+    }
+
+    #[test]
+    fn store_load_goes_to_the_worker_with_fewer_active_loads() {
+        let p = Parameters::default();
+        // Ranks 0/1 on worker 7 (rank 1 has 6 active requests), ranks 2/3 on worker 9 (1 active).
+        // Rank 0 and rank 2 are idle; the prompt loads 131K tokens (~2.8 GB) from the store.
+        let ranks = [
+            rank_on(7, 0.0, 0, 0),
+            rank_on(7, 0.0, 30_000, 6),
+            rank_on(9, 0.0, 0, 0),
+            rank_on(9, 0.0, 30_000, 1),
+        ];
+        let costs = row_costs(&p, 140_000, BS, 131_072, &ranks);
+        assert_eq!(select_row(&costs, &ranks), Some(2), "{costs:?}");
+        // Seven sharers instead of two: five extra transfers of ~2.8 GB at 16 GB/s.
+        let bytes = p.load_state_bytes + p.load_bytes_per_token * 131_072.0;
+        let expected = 5.0 * bytes / (p.node_read_gbps * 1e6);
+        assert!(((costs[0] - costs[2]) - expected).abs() < 1e-6, "{costs:?}");
+    }
+
+    #[test]
+    fn zero_node_bandwidth_drops_the_shared_term() {
+        let p = Parameters {
+            node_read_gbps: 0.0,
+            ..Parameters::default()
+        };
+        let ranks = [rank_on(7, 0.0, 0, 0), rank_on(7, 0.0, 0, 9), rank_on(9, 0.0, 0, 0)];
+        let costs = row_costs(&p, 140_000, BS, 131_072, &ranks);
+        assert_eq!(costs[0], costs[2], "{costs:?}");
+    }
+
+    #[test]
+    fn kv_full_rank_loses_its_device_hit() {
+        let p = Parameters {
+            kv_capacity_blocks: 12.0,
+            ..Parameters::default()
+        };
+        // Rank 1 holds the prefix but its active KV (6 blocks) + this 9-block prompt overflows.
+        let mut hit = rank_on(9, 8.0, 0, 0);
+        hit.active_blocks = 6.0;
+        let ranks = [rank_on(7, 0.0, 0, 0), hit];
+        let costs = row_costs(&p, 140_000, BS, 131_072, &ranks);
+        assert_eq!(select_row(&costs, &ranks), Some(0), "{costs:?}");
+        // Without the capacity bound the device hit wins.
+        let costs = row_costs(&Parameters::default(), 140_000, BS, 131_072, &ranks);
+        assert_eq!(select_row(&costs, &ranks), Some(1), "{costs:?}");
     }
 
     #[test]
@@ -298,7 +417,10 @@ mod tests {
             + p.uncached_times_context * fresh * (131_072.0 + fresh / 2.0)
             + p.per_request;
         // Idle engine: the request itself raises the lockstep maximum by its own cost.
-        let expected = p.load_fixed + p.load_per_token * 131_072.0 + request + p.balance_weight * request;
+        // One sharer (this load) of the worker's store read bandwidth.
+        let transfer = (p.load_state_bytes + p.load_bytes_per_token * 131_072.0) / (p.node_read_gbps * 1e6);
+        let expected = p.load_fixed + p.load_per_token * 131_072.0 + transfer + request
+            + p.balance_weight * request;
         assert!((costs[0] - expected).abs() < 1e-6, "{costs:?} vs {expected}");
         let cold = p.uncached * 140_000.0
             + p.uncached_times_context * 140_000.0 * 70_000.0
