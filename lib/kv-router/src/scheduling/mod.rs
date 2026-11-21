@@ -3,6 +3,7 @@
 
 pub mod config;
 mod filter;
+pub mod global_prefix;
 mod local;
 pub mod overlap;
 pub mod overlap_refresh;

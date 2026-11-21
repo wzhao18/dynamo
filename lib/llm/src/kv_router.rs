@@ -1510,6 +1510,17 @@ where
         let block_hashes = tracing::info_span!("kv_router.compute_block_hashes")
             .in_scope(|| compute_block_hash_for_seq(tokens, self.block_size, hash_options));
         log_routing_input_hashes(context_id, self.block_size, tokens, &block_hashes);
+        // Global write-through store model (prefill routers only, enabled by a policy that models
+        // the store): the leading blocks of this prompt that were routed earlier to any worker.
+        let global_prefix = if self.worker_type() == "prefill" {
+            dynamo_kv_router::scheduling::global_prefix::registry().map(|registry| {
+                let chain = dynamo_kv_router::scheduling::global_prefix::chain_hashes(&block_hashes);
+                let (blocks, tokens) = registry.resident_prefix(&chain, self.block_size, isl_tokens);
+                (registry, chain, blocks, tokens)
+            })
+        } else {
+            None
+        };
         let hash_elapsed = start.elapsed();
         // Compute seq_hashes only if scheduler needs it for active blocks tracking
         let maybe_seq_hashes = tracing::info_span!("kv_router.compute_seq_hashes").in_scope(|| {
@@ -1543,7 +1554,7 @@ where
 
         let TieredLookupResult {
             tiered_matches,
-            shared_cache_hits,
+            mut shared_cache_hits,
             indexer_duration,
             shared_cache_duration,
             retained_block_hashes,
@@ -1571,6 +1582,15 @@ where
             })
             .unwrap_or((None, None));
 
+        if shared_cache_hits.is_none()
+            && let Some((_, _, blocks, tokens)) = global_prefix.as_ref()
+            && *blocks > 0
+        {
+            let mut hits =
+                dynamo_kv_router::protocols::SharedCacheHits::from_ranges(vec![0..*blocks as u32]);
+            hits.resident_prefix_tokens = Some(*tokens);
+            shared_cache_hits = Some(hits);
+        }
         let overlap =
             OverlapAnalysis::new(&self.kv_router_config, self.block_size, &tiered_matches)
                 .signals();
@@ -1653,6 +1673,9 @@ where
                 Err(error) => return Err(map_scheduler_error(error)),
             },
         };
+        if is_admitted_routing && let Some((registry, chain, _, _)) = global_prefix.as_ref() {
+            registry.insert(chain, isl_tokens);
+        }
         let router_hint = if is_admitted_routing {
             self.router_hint_for_selection(
                 response.best_worker,

@@ -1602,13 +1602,20 @@ pub struct SharedCacheHits {
     pub ranges: Vec<Range<u32>>,
     /// Total number of hits (sum of range lengths).
     pub total_hits: u32,
+    /// Resident prefix length in tokens when the source knows it more precisely than whole
+    /// blocks (the router's global-prefix store model). `None` for other shared caches.
+    pub resident_prefix_tokens: Option<usize>,
 }
 
 impl SharedCacheHits {
     /// Create from sorted, non-overlapping ranges.
     pub fn from_ranges(ranges: Vec<Range<u32>>) -> Self {
         let total_hits = ranges.iter().map(|r| r.end - r.start).sum();
-        Self { ranges, total_hits }
+        Self {
+            ranges,
+            total_hits,
+            resident_prefix_tokens: None,
+        }
     }
 
     /// Create from a boolean hit vector (convenience for tests and simple backends).

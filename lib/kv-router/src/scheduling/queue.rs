@@ -1516,9 +1516,17 @@ impl<
             .expect("tracked mode always has a request ID")
             .to_string();
 
+        // A global write-through store (router global-prefix model) serves its resident prefix
+        // to every worker, so book those tokens as cached even when the selected worker's device
+        // overlap is shorter: the booked prefill load is then the tokens it really computes.
+        let store_cached_tokens = request
+            .shared_cache_hits
+            .as_ref()
+            .and_then(|hits| hits.resident_prefix_tokens)
+            .unwrap_or(0);
         let prefill_load_hint = self.prefill_load_hint_for(
             request.isl_tokens,
-            selected.selection.cached_tokens,
+            selected.selection.cached_tokens.max(store_cached_tokens),
             request.track_prefill_tokens,
         );
 

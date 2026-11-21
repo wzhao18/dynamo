@@ -18,6 +18,7 @@
 //! beyond `dynamo-kv-router`, put it behind its own default-on Cargo feature so a build can drop
 //! it; every policy registered here is compiled into every artifact that links this crate.
 
+mod prefill_step_cost;
 mod two_tier_cost_fn;
 
 use dynamo_kv_router::services::selection::{
@@ -32,7 +33,8 @@ use dynamo_kv_router::services::selection::{
 pub fn register(
     registry: &mut WorkerSelectionPolicyRegistry,
 ) -> Result<(), WorkerSelectionPolicyRegistryError> {
-    two_tier_cost_fn::register(registry)
+    two_tier_cost_fn::register(registry)?;
+    prefill_step_cost::register(registry)
 }
 
 #[cfg(test)]

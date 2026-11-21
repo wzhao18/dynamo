@@ -156,6 +156,27 @@ pub trait WorkerPicker: Send {
 }
 
 impl WorkerSelectionContext<'_> {
+    /// Return the incoming prompt size in tokens.
+    pub fn isl_tokens(&self) -> usize {
+        self.request.isl_tokens
+    }
+
+    /// Return the prompt's leading tokens resident in a shared KV store that every worker can
+    /// load from (0 when no shared-store signal is available). Uses the store's token-precise
+    /// length when the source provides one, else its leading block range.
+    pub fn shared_prefix_tokens(&self) -> usize {
+        let Some(hits) = self.request.shared_cache_hits.as_ref() else {
+            return 0;
+        };
+        let tokens = hits.resident_prefix_tokens.unwrap_or_else(|| {
+            hits.ranges
+                .first()
+                .filter(|range| range.start == 0)
+                .map_or(0, |range| range.end as usize * self.block_size as usize)
+        });
+        tokens.min(self.request.isl_tokens)
+    }
+
     /// Return the incoming prompt size in KV blocks.
     pub fn request_blocks(&self) -> u64 {
         self.request_blocks
