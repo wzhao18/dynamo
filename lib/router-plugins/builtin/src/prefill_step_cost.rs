@@ -292,11 +292,18 @@ mod tests {
         let p = Parameters::default();
         let ranks = [rank(0.0, 0, 0), rank(0.0, 0, 0)];
         let costs = row_costs(&p, 140_000, BS, 131_072, &ranks);
-        // Fresh 8928 tokens + load, not a 140K cold prefill.
+        // Fresh 8928 tokens after a store load of 131072 tokens, not a 140K cold prefill.
+        let fresh = 140_000.0 - 131_072.0;
+        let expected = p.load_fixed
+            + p.load_per_token * 131_072.0
+            + p.uncached * fresh
+            + p.uncached_times_context * fresh * (131_072.0 + fresh / 2.0)
+            + p.per_request;
+        assert!((costs[0] - expected).abs() < 1e-6, "{costs:?} vs {expected}");
         let cold = p.uncached * 140_000.0
             + p.uncached_times_context * 140_000.0 * 70_000.0
             + p.per_request;
-        assert!(costs[0] < cold / 2.0, "{costs:?} vs cold {cold}");
+        assert!(costs[0] < cold, "{costs:?} vs cold {cold}");
     }
 
     #[test]

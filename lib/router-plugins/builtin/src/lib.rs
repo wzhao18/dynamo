@@ -94,6 +94,31 @@ worker_selection:
         }
     }
 
+    /// The OVHFIX-4 prefill routing YAML resolves for the prefill role.
+    #[test]
+    fn resolves_prefill_step_cost_yaml() {
+        let (config, resolved) = resolve(
+            r#"
+worker_selection:
+  prefill: ovh4-step-cost
+  instances:
+    - name: ovh4-step-cost
+      type: prefill-step-cost
+      parameters:
+        store_retention_secs: 3600
+"#,
+        );
+        let factory = resolved
+            .unwrap()
+            .expect("a configured instance resolves to a factory");
+        factory(
+            &config,
+            WorkerType::Prefill,
+            RoutingPartitionRef::new("model", "default"),
+        );
+        assert!(dynamo_kv_router::scheduling::global_prefix::registry().is_some());
+    }
+
     /// An unknown parameter key is a mistake, most often a misremembered threshold name. It must
     /// fail startup rather than silently leaving the default in place.
     #[test]
