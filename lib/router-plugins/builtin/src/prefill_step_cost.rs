@@ -165,6 +165,17 @@ impl Rank {
     }
 }
 
+/// The terms of one row's cost, in ms.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct RowTerms {
+    load: f64,
+    backlog: f64,
+    request: f64,
+    excess: f64,
+    kv: f64,
+    cost: f64,
+}
+
 /// Per-row costs; split out so tests can check the arithmetic without a router.
 fn row_costs(
     parameters: &Parameters,
@@ -173,6 +184,48 @@ fn row_costs(
     shared_prefix_tokens: usize,
     ranks: &[Rank],
 ) -> Vec<f64> {
+    row_terms(parameters, isl, block_size, shared_prefix_tokens, ranks)
+        .into_iter()
+        .map(|terms| terms.cost)
+        .collect()
+}
+
+/// One in `TERMS_SAMPLE_EVERY` selections logs every candidate's cost terms, so the
+/// placement decisions can be audited against engine-side cache hits offline.
+const TERMS_SAMPLE_EVERY: u64 = 100;
+static SELECTIONS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Compact per-candidate record: `dp:overlap_blocks:load:backlog:request:excess:kv:cost:active_requests:active_blocks`.
+fn format_terms(dp_ranks: &[u32], ranks: &[Rank], terms: &[RowTerms]) -> String {
+    let mut out = String::with_capacity(terms.len() * 48);
+    for ((dp, rank), t) in dp_ranks.iter().zip(ranks).zip(terms) {
+        if !out.is_empty() {
+            out.push(' ');
+        }
+        out.push_str(&format!(
+            "{dp}:{:.0}:{:.0}:{:.0}:{:.0}:{:.0}:{:.0}:{:.0}:{}:{:.0}",
+            rank.device_overlap_blocks,
+            t.load,
+            t.backlog,
+            t.request,
+            t.excess,
+            t.kv,
+            t.cost,
+            rank.active_requests,
+            rank.active_blocks
+        ));
+    }
+    out
+}
+
+/// Per-row cost terms.
+fn row_terms(
+    parameters: &Parameters,
+    isl: usize,
+    block_size: u32,
+    shared_prefix_tokens: usize,
+    ranks: &[Rank],
+) -> Vec<RowTerms> {
     let backlog: Vec<f64> = ranks.iter().map(|r| parameters.backlog_ms(r)).collect();
     let max_backlog = backlog.iter().copied().fold(0.0, f64::max);
     let isl_f = isl as f64;
@@ -216,7 +269,14 @@ fn row_costs(
                 0.0
             };
             let excess = (backlog + request - max_backlog).max(0.0);
-            load.max(backlog) + request + parameters.balance_weight * excess + kv
+            RowTerms {
+                load,
+                backlog,
+                request,
+                excess,
+                kv,
+                cost: load.max(backlog) + request + parameters.balance_weight * excess + kv,
+            }
         })
         .collect()
 }
@@ -261,15 +321,33 @@ impl WorkerPicker for PrefillStepCostPicker {
                 Rank::from_inputs(candidate.worker().worker_id, cache, load)
             })
             .collect();
-        let costs = row_costs(
+        let terms = row_terms(
             &self.parameters,
             context.isl_tokens(),
             context.block_size(),
             context.shared_prefix_tokens(),
             &ranks,
         );
-        select_row(&costs, &ranks)
-            .ok_or_else(|| WorkerSelectionPolicyError::failed("no eligible worker"))
+        let costs: Vec<f64> = terms.iter().map(|t| t.cost).collect();
+        let chosen = select_row(&costs, &ranks)
+            .ok_or_else(|| WorkerSelectionPolicyError::failed("no eligible worker"))?;
+        if SELECTIONS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) % TERMS_SAMPLE_EVERY == 0 {
+            let dp_ranks: Vec<u32> = input
+                .candidates()
+                .iter()
+                .map(|candidate| candidate.worker().dp_rank)
+                .collect();
+            tracing::info!(
+                target: "prefill_step_cost.terms",
+                request_id = context.request_id(),
+                isl = context.isl_tokens(),
+                shared_prefix_tokens = context.shared_prefix_tokens(),
+                chosen_dp = dp_ranks[chosen],
+                candidates = %format_terms(&dp_ranks, &ranks, &terms),
+                "prefill step-cost terms"
+            );
+        }
+        Ok(chosen)
     }
 }
 
@@ -301,6 +379,27 @@ pub fn register(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn row_terms_sum_to_row_costs_and_format_is_stable() {
+        let p = Parameters::default();
+        let ranks = [rank(7.0, 0, 0), rank(0.0, 16_384, 1)];
+        let terms = row_terms(&p, 120_000, BS, 120_000, &ranks);
+        let costs = row_costs(&p, 120_000, BS, 120_000, &ranks);
+        for (t, c) in terms.iter().zip(&costs) {
+            assert_eq!(t.cost, *c);
+            assert_eq!(
+                t.cost,
+                t.load.max(t.backlog) + t.request + p.balance_weight * t.excess + t.kv
+            );
+        }
+        // The rank holding 7 device blocks loads only the store tail; the other loads it all.
+        assert!(terms[0].load < terms[1].load);
+        let line = format_terms(&[3, 9], &ranks, &terms);
+        assert_eq!(line.split(' ').count(), 2);
+        assert!(line.starts_with("3:7:"));
+        assert_eq!(line.split(' ').nth(1).unwrap().split(':').count(), 10);
+    }
 
     const BS: u32 = 16384;
 

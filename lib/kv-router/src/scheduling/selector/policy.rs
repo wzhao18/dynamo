@@ -156,6 +156,11 @@ pub trait WorkerPicker: Send {
 }
 
 impl WorkerSelectionContext<'_> {
+    /// Return the id of the request being routed.
+    pub fn request_id(&self) -> &str {
+        self.request_id
+    }
+
     /// Return the incoming prompt size in tokens.
     pub fn isl_tokens(&self) -> usize {
         self.request.isl_tokens
