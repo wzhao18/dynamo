@@ -18,6 +18,7 @@
 //! beyond `dynamo-kv-router`, put it behind its own default-on Cargo feature so a build can drop
 //! it; every policy registered here is compiled into every artifact that links this crate.
 
+mod decode_step_cost;
 mod prefill_step_cost;
 mod two_tier_cost_fn;
 
@@ -34,7 +35,8 @@ pub fn register(
     registry: &mut WorkerSelectionPolicyRegistry,
 ) -> Result<(), WorkerSelectionPolicyRegistryError> {
     two_tier_cost_fn::register(registry)?;
-    prefill_step_cost::register(registry)
+    prefill_step_cost::register(registry)?;
+    decode_step_cost::register(registry)
 }
 
 #[cfg(test)]
@@ -92,6 +94,41 @@ worker_selection:
         ] {
             factory(&config, worker_type, partition);
         }
+    }
+
+    /// With only a prefill policy selected (the AgentX render), decode still resolves to a
+    /// policy factory: the decode step-cost default, not the KV-footprint-only selector.
+    #[test]
+    fn decode_defaults_to_step_cost_when_unselected() {
+        let (config, resolved) = resolve(
+            r#"
+worker_selection:
+  prefill: ovh4-step-cost
+  instances:
+    - name: ovh4-step-cost
+      type: prefill-step-cost
+"#,
+        );
+        let factory = resolved.unwrap().expect("decode default makes a factory");
+        factory(
+            &config,
+            WorkerType::Decode,
+            RoutingPartitionRef::new("model", "default"),
+        );
+        let mut registry = WorkerSelectionPolicyRegistry::default();
+        register(&mut registry).unwrap();
+        assert!(
+            registry
+                .resolve_for_worker_type(&KvRouterConfig::default(), WorkerType::Decode)
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            registry
+                .resolve_for_worker_type(&KvRouterConfig::default(), WorkerType::Prefill)
+                .unwrap()
+                .is_none()
+        );
     }
 
     /// The OVHFIX-4 prefill routing YAML resolves for the prefill role.
