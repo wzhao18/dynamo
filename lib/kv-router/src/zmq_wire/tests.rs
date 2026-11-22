@@ -1524,3 +1524,81 @@ fn test_unrecognized_media_do_not_pollute_cache_namespace_state() {
     };
     assert_eq!(cache_namespace.as_deref(), Some("tenant-a"));
 }
+
+fn stored_with_size(hashes: &[u64], parent: Option<u64>, block_size: usize) -> RawKvEvent {
+    RawKvEvent::BlockStored {
+        block_hashes: hashes.iter().copied().map(BlockHashValue::Unsigned).collect(),
+        parent_block_hash: parent.map(BlockHashValue::Unsigned),
+        token_ids: (0..(block_size * hashes.len()) as u32).collect(),
+        block_size,
+        medium: None,
+        lora_name: None,
+        cache_namespace: None,
+        block_mm_infos: None,
+        is_eagle: Some(false),
+        group_idx: None,
+        kv_cache_spec_kind: None,
+        kv_cache_spec_sliding_window: None,
+        locality: None,
+        ownership: None,
+    }
+}
+
+fn removed(hashes: &[u64]) -> RawKvEvent {
+    RawKvEvent::BlockRemoved {
+        block_hashes: hashes.iter().copied().map(BlockHashValue::Unsigned).collect(),
+        medium: None,
+        group_idx: None,
+        kv_cache_spec_kind: None,
+        kv_cache_spec_sliding_window: None,
+        locality: None,
+        ownership: None,
+    }
+}
+
+/// Hybrid engines (attention block raised to the mamba page size) publish
+/// partial-block entries with `block_size < kv_block_size`. They are filtered
+/// before an event id is assigned, and so are their later removals, while
+/// whole-block stores and removals of indexed blocks pass through unchanged.
+#[test]
+fn partial_block_entries_and_their_removals_are_filtered() {
+    let worker = WorkerWithDpRank::new(7, 0);
+    let other = WorkerWithDpRank::new(8, 0);
+    let mut normalizer = ZmqEventNormalizer::new(4);
+
+    // Whole block: indexed.
+    assert!(normalizer.preprocess_with_reason(stored_with_size(&[1], None, 4), worker).is_ok());
+    // Partial entry (one 2-token hash block of a 4-token router block): filtered.
+    assert_eq!(
+        normalizer
+            .preprocess_with_reason(stored_with_size(&[100], Some(1), 2), worker)
+            .err(),
+        Some(ZmqEventFilterReason::PartialBlock)
+    );
+    // Removing only the partial hash: filtered, no unknown-block removal reaches the index.
+    assert_eq!(
+        normalizer.preprocess_with_reason(removed(&[100]), worker).err(),
+        Some(ZmqEventFilterReason::PartialBlock)
+    );
+    // The partial hash is forgotten after its removal.
+    assert!(normalizer.partial_hashes.is_empty());
+
+    // Mixed removal: the partial hash is stripped, the indexed one is kept.
+    assert!(normalizer.preprocess_with_reason(stored_with_size(&[101], Some(1), 2), worker).is_err());
+    let kept = normalizer
+        .preprocess_with_reason(removed(&[1, 101]), worker)
+        .expect("indexed block removal must pass");
+    let RawKvEvent::BlockRemoved { block_hashes, .. } = kept else {
+        panic!("expected BlockRemoved");
+    };
+    assert_eq!(block_hashes.into_iter().map(BlockHashValue::into_u64).collect::<Vec<_>>(), vec![1]);
+
+    // Tracking is per worker: another worker's removal of the same hash passes.
+    assert!(normalizer.preprocess_with_reason(stored_with_size(&[102], None, 2), worker).is_err());
+    assert!(normalizer.preprocess_with_reason(removed(&[102]), other).is_ok());
+    // AllBlocksCleared forgets the worker's partial hashes.
+    assert!(normalizer
+        .preprocess_with_reason(RawKvEvent::AllBlocksCleared { ownership: None }, worker)
+        .is_ok());
+    assert!(normalizer.partial_hashes.is_empty());
+}
