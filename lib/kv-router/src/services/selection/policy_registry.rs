@@ -61,11 +61,11 @@ impl WorkerSelectionPolicyProviderError {
     }
 }
 
-/// A startup-only registry of policy types linked into a custom Dynamo image.
-#[derive(Clone, Default)]
 /// Policy type a decode pool uses when no decode policy is selected.
 pub const DEFAULT_DECODE_POLICY_TYPE: &str = "decode-step-cost";
 
+/// A startup-only registry of policy types linked into a custom Dynamo image.
+#[derive(Clone, Default)]
 pub struct WorkerSelectionPolicyRegistry {
     providers: HashMap<String, WorkerSelectionPolicyProvider>,
 }
