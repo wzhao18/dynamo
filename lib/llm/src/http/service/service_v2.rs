@@ -47,6 +47,26 @@ use dynamo_runtime::metrics::{
 };
 use std::net::SocketAddr;
 use tokio::sync::Notify;
+
+/// Listen backlog of the frontend's HTTP listener. `TcpListener::bind` left the kernel
+/// accept queue at 128 on the served frontend (`ss -ltn` Send-Q 128), while the AgentX
+/// warmup cache-pressure burst opens ~400 new connections within ~1 s. Whenever accept
+/// fell slightly behind (co-located prefill load), SYNs beyond the queue were dropped
+/// (TcpExtListenOverflows) and clients saw ECONNRESET after the 1 s SYN retry, aborting
+/// the c576 run (2026-11-22). 4096 matches the hosts' `net.core.somaxconn`, which caps it.
+const HTTP_LISTEN_BACKLOG: u32 = 4096;
+
+/// Bind the plain-HTTP listener with [`HTTP_LISTEN_BACKLOG`] (SO_REUSEADDR as std's bind).
+fn bind_http_listener(addr: SocketAddr) -> std::io::Result<tokio::net::TcpListener> {
+    let socket = if addr.is_ipv4() {
+        tokio::net::TcpSocket::new_v4()?
+    } else {
+        tokio::net::TcpSocket::new_v6()?
+    };
+    socket.set_reuseaddr(true)?;
+    socket.bind(addr)?;
+    socket.listen(HTTP_LISTEN_BACKLOG)
+}
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use tower_http::trace::TraceLayer;
@@ -899,7 +919,7 @@ impl HttpService {
                     let addr: SocketAddr = address
                         .parse()
                         .map_err(|e| anyhow::anyhow!("Invalid address '{}': {}", address, e))?;
-                    tokio::net::TcpListener::bind(addr).await.map_err(|e| {
+                    bind_http_listener(addr).map_err(|e| {
                         tracing::error!(
                             protocol = %protocol,
                             address = %address,
@@ -2463,5 +2483,51 @@ mod tests {
         for path in ["", "native/vllm", "/:model", "/*path"] {
             assert!(validate_generate_route_path(path).is_err());
         }
+    }
+}
+
+#[cfg(test)]
+mod listen_backlog_tests {
+    use super::*;
+
+    /// Opens `n` connections at once to a listener that never accepts and counts the
+    /// ones whose handshake completes within 2 s (the kernel queues at most backlog + 1).
+    async fn queued_connects(listener: &tokio::net::TcpListener, n: usize) -> usize {
+        let addr = listener.local_addr().unwrap();
+        let tasks: Vec<_> = (0..n)
+            .map(|_| {
+                tokio::spawn(async move {
+                    tokio::time::timeout(
+                        Duration::from_secs(2),
+                        tokio::net::TcpStream::connect(addr),
+                    )
+                    .await
+                    .ok()
+                    .and_then(|r| r.ok())
+                })
+            })
+            .collect();
+        let mut held = Vec::new();
+        for t in tasks {
+            if let Some(stream) = t.await.unwrap() {
+                held.push(stream);
+            }
+        }
+        held.len()
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+    async fn http_listener_queues_a_600_connection_burst() {
+        let listener = bind_http_listener("127.0.0.1:0".parse().unwrap()).unwrap();
+        assert_eq!(queued_connects(&listener, 600).await, 600);
+    }
+
+    /// Control: the old 128 backlog cannot hold the same burst without accepting.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+    async fn control_backlog_128_drops_part_of_the_burst() {
+        let socket = tokio::net::TcpSocket::new_v4().unwrap();
+        socket.bind("127.0.0.1:0".parse().unwrap()).unwrap();
+        let listener = socket.listen(128).unwrap();
+        assert!(queued_connects(&listener, 600).await < 600);
     }
 }
