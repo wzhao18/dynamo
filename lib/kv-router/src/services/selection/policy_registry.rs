@@ -63,6 +63,9 @@ impl WorkerSelectionPolicyProviderError {
 
 /// A startup-only registry of policy types linked into a custom Dynamo image.
 #[derive(Clone, Default)]
+/// Policy type a decode pool uses when no decode policy is selected.
+pub const DEFAULT_DECODE_POLICY_TYPE: &str = "decode-step-cost";
+
 pub struct WorkerSelectionPolicyRegistry {
     providers: HashMap<String, WorkerSelectionPolicyProvider>,
 }
@@ -144,7 +147,29 @@ impl WorkerSelectionPolicyRegistry {
         let policy_config = config.worker_selection_config().map_err(|source| {
             crate::scheduling::config::WorkerSelectionPolicyConfigError::Config { source }
         })?;
+        if selected.is_none() && worker_type == WorkerType::Decode {
+            return self.default_decode_policy();
+        }
         self.resolve_selected(policy_config, selected.as_deref())
+    }
+
+    /// Lockstep DP decode is set by its busiest rank, so a decode pool without an explicitly
+    /// selected policy uses the registered decode step-cost policy (default parameters) instead of
+    /// the KV-footprint-only default selector. Builds that link no such policy keep the default.
+    fn default_decode_policy(
+        &self,
+    ) -> Result<Option<WorkerSelectionPolicyFactory>, WorkerSelectionPolicyRegistryError> {
+        let Some(provider) = self.providers.get(DEFAULT_DECODE_POLICY_TYPE) else {
+            return Ok(None);
+        };
+        provider(&WorkerSelectionPolicyParameters::new(serde_yaml::Value::Mapping(
+            serde_yaml::Mapping::new(),
+        )))
+        .map(Some)
+        .map_err(|source| WorkerSelectionPolicyRegistryError::Provider {
+            policy_type: DEFAULT_DECODE_POLICY_TYPE.to_owned(),
+            source,
+        })
     }
 
     fn resolve_selections(
@@ -163,8 +188,10 @@ impl WorkerSelectionPolicyRegistry {
             selected.prefill.as_deref(),
             &mut resolved,
         )?;
-        let decode =
-            self.resolve_selected_cached(policy_config, selected.decode.as_deref(), &mut resolved)?;
+        let decode = match selected.decode.as_deref() {
+            Some(name) => self.resolve_selected_cached(policy_config, Some(name), &mut resolved)?,
+            None => self.default_decode_policy()?,
+        };
         let encode =
             self.resolve_selected_cached(policy_config, selected.encode.as_deref(), &mut resolved)?;
 

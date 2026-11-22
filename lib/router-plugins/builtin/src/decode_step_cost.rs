@@ -1,7 +1,8 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-//! Decode step-cost worker selection for data-parallel decode engines.
+//! Decode step-cost worker selection for data-parallel decode engines. It is the default policy
+//! for a decode pool with no explicitly selected policy (see `DEFAULT_DECODE_POLICY_TYPE`).
 //!
 //! Every candidate is one `(worker, dp_rank)` of a lockstep DP decode engine. The ranks step
 //! together, so the slowest rank sets every decode step; the policy therefore places each new

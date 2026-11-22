@@ -96,6 +96,41 @@ worker_selection:
         }
     }
 
+    /// With only a prefill policy selected (the AgentX render), decode still resolves to a
+    /// policy factory: the decode step-cost default, not the KV-footprint-only selector.
+    #[test]
+    fn decode_defaults_to_step_cost_when_unselected() {
+        let (config, resolved) = resolve(
+            r#"
+worker_selection:
+  prefill: ovh4-step-cost
+  instances:
+    - name: ovh4-step-cost
+      type: prefill-step-cost
+"#,
+        );
+        let factory = resolved.unwrap().expect("decode default makes a factory");
+        factory(
+            &config,
+            WorkerType::Decode,
+            RoutingPartitionRef::new("model", "default"),
+        );
+        let mut registry = WorkerSelectionPolicyRegistry::default();
+        register(&mut registry).unwrap();
+        assert!(
+            registry
+                .resolve_for_worker_type(&KvRouterConfig::default(), WorkerType::Decode)
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            registry
+                .resolve_for_worker_type(&KvRouterConfig::default(), WorkerType::Prefill)
+                .unwrap()
+                .is_none()
+        );
+    }
+
     /// The OVHFIX-4 prefill routing YAML resolves for the prefill role.
     #[test]
     fn resolves_prefill_step_cost_yaml() {
