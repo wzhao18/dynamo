@@ -11,7 +11,7 @@ use std::sync::Arc;
 use std::sync::atomic::AtomicU32;
 
 use rmp_serde as rmps;
-use rustc_hash::{FxHashMap, FxHashSet};
+use rustc_hash::FxHashMap;
 
 use crate::protocols::{DpRank, PlacementEvent, StorageTier, WorkerWithDpRank};
 
@@ -55,9 +55,6 @@ pub struct ZmqEventNormalizer {
     warning_count: Arc<AtomicU32>,
     group_metadata: FxHashMap<(DpRank, u32), KvCacheGroupMetadata>,
     cache_namespaces: FxHashMap<(WorkerWithDpRank, u64), CacheNamespaceState>,
-    /// Hashes of partial-block entries dropped by `PartialBlock`, so their later
-    /// removals are dropped too instead of reaching the index as unknown blocks.
-    partial_hashes: FxHashSet<(WorkerWithDpRank, u64)>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -84,10 +81,6 @@ pub enum ZmqEventFilterReason {
     UnknownKind,
     NonMainAttentionGroup,
     UnlearnedGroupIdx,
-    /// A stored event whose block is smaller than the router's kv_block_size
-    /// (an engine's partial-block cache entry), or a removal that only names
-    /// such entries. The router indexes whole blocks only.
-    PartialBlock,
 }
 
 impl ZmqEventFilterReason {
@@ -103,7 +96,6 @@ impl ZmqEventFilterReason {
             Self::UnknownKind => "unknown_kind",
             Self::NonMainAttentionGroup => "non_main_attention_group",
             Self::UnlearnedGroupIdx => "unlearned_group_idx",
-            Self::PartialBlock => "partial_block",
         }
     }
 }
@@ -117,7 +109,6 @@ impl ZmqEventNormalizer {
             warning_count: Arc::new(AtomicU32::new(0)),
             group_metadata: FxHashMap::default(),
             cache_namespaces: FxHashMap::default(),
-            partial_hashes: FxHashSet::default(),
         }
     }
 
@@ -129,7 +120,6 @@ impl ZmqEventNormalizer {
             warning_count,
             group_metadata: FxHashMap::default(),
             cache_namespaces: FxHashMap::default(),
-            partial_hashes: FxHashSet::default(),
         }
     }
 
@@ -217,60 +207,8 @@ impl ZmqEventNormalizer {
         if let Some(reason) = self.filter_reason(metadata, worker.dp_rank) {
             return Err(reason);
         }
-        self.filter_partial_blocks(&mut raw, worker)?;
         self.propagate_cache_namespace(&mut raw, worker)?;
         Ok(raw)
-    }
-
-    /// Drop partial-block entries before an event id is assigned.
-    ///
-    /// Engines whose cache block is coarse (hybrid attention+mamba models raise
-    /// the attention block to the mamba page size, e.g. 16384 tokens) also cache
-    /// a partially filled block at a finer hash granularity and publish it as a
-    /// `BlockStored` with `block_size < kv_block_size`, parented on a finer hash.
-    /// Such an event holds no whole router block: indexing it yields zero blocks,
-    /// and every child then misses its parent. Its eventual removal names a hash
-    /// the index never held. Both are dropped here (counted via the filter
-    /// reason), and removals of other hashes in the same event are kept.
-    fn filter_partial_blocks(
-        &mut self,
-        raw: &mut RawKvEvent,
-        worker: WorkerWithDpRank,
-    ) -> Result<(), ZmqEventFilterReason> {
-        match raw {
-            RawKvEvent::BlockStored {
-                block_hashes,
-                block_size,
-                ..
-            } => {
-                if !block_hashes.is_empty() && (*block_size as u64) < self.kv_block_size as u64 {
-                    for hash in block_hashes.iter() {
-                        self.partial_hashes.insert((worker, (*hash).into_u64()));
-                    }
-                    return Err(ZmqEventFilterReason::PartialBlock);
-                }
-                // A whole-block store may reuse a hash that was partial before.
-                for hash in block_hashes.iter() {
-                    self.partial_hashes.remove(&(worker, (*hash).into_u64()));
-                }
-            }
-            RawKvEvent::BlockRemoved { block_hashes, .. } => {
-                if self.partial_hashes.is_empty() || block_hashes.is_empty() {
-                    return Ok(());
-                }
-                block_hashes
-                    .retain(|hash| !self.partial_hashes.remove(&(worker, (*hash).into_u64())));
-                if block_hashes.is_empty() {
-                    return Err(ZmqEventFilterReason::PartialBlock);
-                }
-            }
-            RawKvEvent::AllBlocksCleared { .. } => {
-                self.partial_hashes
-                    .retain(|(known_worker, _)| *known_worker != worker);
-            }
-            RawKvEvent::Ignored => {}
-        }
-        Ok(())
     }
 
     pub fn normalize_preprocessed(
