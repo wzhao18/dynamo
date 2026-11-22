@@ -174,7 +174,11 @@ fn log_pick(
     let active: Vec<usize> = order.iter().map(|&i| ranks[i].active_requests).collect();
     let booked_blocks: Vec<u64> = order
         .iter()
-        .map(|&i| (ranks[i].projected_blocks - request_blocks).max(0.0).round() as u64)
+        .map(|&i| {
+            (ranks[i].projected_blocks - request_blocks)
+                .max(0.0)
+                .round() as u64
+        })
         .collect();
     let (worker_id, dp_rank) = candidates
         .get(row)
@@ -243,7 +247,10 @@ mod tests {
         assert_eq!(p.per_mtok, 0.0703);
         // 82 blocks of 16384 tokens per request (the stock-units weight of the replay).
         let blocks_per_request = p.per_request / p.per_mtok * 1e6 / BS as f64;
-        assert!((blocks_per_request - 82.0).abs() < 0.1, "{blocks_per_request}");
+        assert!(
+            (blocks_per_request - 82.0).abs() < 0.1,
+            "{blocks_per_request}"
+        );
     }
 
     #[test]
