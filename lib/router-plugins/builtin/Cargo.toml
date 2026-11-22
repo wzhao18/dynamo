@@ -14,6 +14,11 @@ description = "Worker-selection policies Dynamo ships and always links"
 [dependencies]
 dynamo-kv-router = { workspace = true, features = ["standalone-selection"] }
 serde.workspace = true
+tracing.workspace = true
 
 [dev-dependencies]
+# `bench` exposes the kv-router test fixtures (SimpleWorkerConfig) for the scheduler-level tests.
+dynamo-kv-router = { workspace = true, features = ["standalone-selection", "bench"] }
 tempfile = { workspace = true }
+tokio = { workspace = true }
+tokio-util = { workspace = true }

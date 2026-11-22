@@ -3065,3 +3065,104 @@ async fn explicit_worker_disappearing_after_preview_is_not_revalidated() {
     drop(host);
     runtime.shutdown();
 }
+
+/// Router-side in-flight requests (booked at selection; what the decode-step-cost policy reads)
+/// on all ranks of the routing host.
+async fn router_in_flight(router: &RoutingHost) -> usize {
+    router
+        .kv_router()
+        .get_potential_loads(&[1], None, None, None, None)
+        .await
+        .unwrap()
+        .iter()
+        .map(|load| load.active_requests)
+        .sum()
+}
+
+/// The in-flight count drains to 0 whichever way a routed request ends: a finished stream, an
+/// abort before dispatch, an error frame (a failed KV transfer on the decode worker), a terminal
+/// error frame followed by end of stream, and a client disconnect that drops the request
+/// mid-flight.
+#[tokio::test]
+#[serial_test::serial]
+async fn routed_request_bookings_drain_on_finish_abort_failure_and_disconnect() {
+    let (router, runtime) = router_with_workers(None, &[1, 2, 3, 4]).await;
+
+    let (_, _, mut finished) = track_request(&router, false).await;
+    let (_, _, mut aborted) = track_request(&router, false).await;
+    let (failed_request, _, failed_guard) = track_request(&router, false).await;
+    let (terminal_request, _, terminal_guard) = track_request(&router, false).await;
+    let (_, _, disconnected) = track_request(&router, false).await;
+    assert_eq!(router_in_flight(&router).await, 5);
+    let in_flight_per_worker: Vec<usize> = router
+        .kv_router()
+        .get_potential_loads(&[1], None, None, None, None)
+        .await
+        .unwrap()
+        .iter()
+        .map(|load| load.active_requests)
+        .collect();
+    assert_eq!(in_flight_per_worker.len(), 4);
+    assert_eq!(in_flight_per_worker.iter().sum::<usize>(), 5);
+
+    // Finish.
+    finished.start_dispatch("decode");
+    finished.mark_dispatched();
+    finished.finish().await;
+    drop(finished);
+    assert_eq!(router_in_flight(&router).await, 4);
+
+    // Abort before dispatch.
+    aborted.abort().await;
+    drop(aborted);
+    assert_eq!(router_in_flight(&router).await, 3);
+
+    // Error frame, e.g. the decode worker failed to pull the prefill KV.
+    let failure = Annotated {
+        data: None,
+        id: None,
+        event: Some("error".to_string()),
+        comment: None,
+        error: Some(
+            DynamoError::builder()
+                .error_type(ErrorType::Backend(BackendError::Unknown))
+                .message("KV transfer failed")
+                .build(),
+        ),
+    };
+    let source = ResponseStream::new(
+        Box::pin(stream::once(async move { failure })),
+        failed_request.context().clone(),
+    );
+    let monitored = monitor_response_stream(source, failed_request.context().clone(), failed_guard);
+    tokio::pin!(monitored);
+    assert!(monitored.next().await.expect("error item").error.is_some());
+    assert_eq!(router_in_flight(&router).await, 2);
+
+    // Terminal error frame (finish_reason error) and then end of stream.
+    let mut output = LLMEngineOutput::default();
+    output.finish_reason = Some(FinishReason::Error("KV transfer failed".to_string()));
+    let terminal = Annotated::from_data(output);
+    let source = ResponseStream::new(
+        Box::pin(stream::once(async move { terminal })),
+        terminal_request.context().clone(),
+    );
+    let monitored =
+        monitor_response_stream(source, terminal_request.context().clone(), terminal_guard);
+    let items: Vec<_> = monitored.collect().await;
+    assert_eq!(items.len(), 1);
+
+    // Client disconnect: the request is dropped without finish or abort.
+    drop(disconnected);
+
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while router_in_flight(&router).await != 0 {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("router in-flight requests must drain to 0");
+
+    drop(router);
+    runtime.shutdown();
+}

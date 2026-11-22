@@ -16,7 +16,8 @@ use std::collections::HashMap;
 use std::env;
 use std::future::Future;
 #[cfg(test)]
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::AtomicUsize;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::task::{Context, Poll};
 use tokio::sync::watch;
@@ -367,6 +368,8 @@ pub struct ActiveSequencesMultiWorker<P: SequencePublisher> {
     pub(super) replica_worker_policy: ReplicaWorkerPolicy,
     replica_request_lease_observer: OnceLock<Arc<dyn ReplicaRequestLeaseObserver>>,
     worker_type: &'static str,
+    /// Set while any rank has an in-flight request; cleared (and logged) when every rank drains.
+    inflight_seen: AtomicBool,
 }
 
 impl<P: SequencePublisher + 'static> ActiveSequencesMultiWorker<P> {
@@ -511,6 +514,7 @@ impl<P: SequencePublisher + 'static> ActiveSequencesMultiWorker<P> {
             replica_worker_policy: options.replica_worker_policy,
             replica_request_lease_observer: OnceLock::new(),
             worker_type,
+            inflight_seen: AtomicBool::new(false),
         }
     }
 
@@ -571,11 +575,39 @@ impl<P: SequencePublisher + 'static> ActiveSequencesMultiWorker<P> {
 
         self.publisher
             .observe_load(&worker, self.worker_type, active_blocks, active_tokens);
+        self.note_inflight_drain(load.active_requests);
 
         SchedulerLoadSnapshot {
             worker,
             active_decode_blocks: active_blocks as u64,
             active_prefill_tokens: active_tokens as u64,
+        }
+    }
+
+    /// Logs once each time the router-side in-flight request count (routed and not yet
+    /// finished, aborted or failed) returns to zero on every rank, so a served run can show that
+    /// the count the selection policies read drains at the end. The all-rank scan runs only when
+    /// one rank reaches zero.
+    fn note_inflight_drain(&self, worker_active_requests: usize) {
+        if worker_active_requests > 0 {
+            if !self.inflight_seen.load(Ordering::Relaxed) {
+                self.inflight_seen.store(true, Ordering::Relaxed);
+            }
+            return;
+        }
+        if !self.inflight_seen.load(Ordering::Relaxed) {
+            return;
+        }
+        let counts = self.prompt_registry.active_request_counts();
+        if counts.values().any(|&count| count > 0) {
+            return;
+        }
+        if self.inflight_seen.swap(false, Ordering::Relaxed) {
+            tracing::info!(
+                worker_type = self.worker_type,
+                ranks = counts.len(),
+                "router in-flight requests drained to 0 on all ranks"
+            );
         }
     }
 
@@ -2673,6 +2705,49 @@ mod tests {
                 .copied(),
             Some(Ok(9_000))
         );
+    }
+
+    #[test]
+    fn inflight_drain_marker_clears_only_when_every_rank_is_empty() {
+        let sequences = make_multi_sequences();
+        let worker_a = WorkerWithDpRank::new(1, 0);
+        let worker_b = WorkerWithDpRank::new(2, 0);
+        let decay_now = Instant::now();
+        let add = |id: &str, worker| {
+            sequences
+                .add_request(
+                    SequenceRequest {
+                        request_id: id.to_string(),
+                        token_sequence: Some(vec![1, 2, 3]),
+                        track_prefill_tokens: false,
+                        expected_output_tokens: None,
+                        prefill_load_hint: tracking_hint(12),
+                        worker,
+                        lora_name: None,
+                    },
+                    decay_now,
+                )
+                .unwrap();
+        };
+        assert!(!sequences.inflight_seen.load(Ordering::Relaxed));
+        add("req-a", worker_a);
+        add("req-b", worker_b);
+        assert!(sequences.inflight_seen.load(Ordering::Relaxed));
+
+        sequences.free(&"req-a".to_string(), decay_now).unwrap();
+        // worker_a is empty but worker_b still has a request in flight.
+        assert!(sequences.inflight_seen.load(Ordering::Relaxed));
+        sequences.free(&"req-b".to_string(), decay_now).unwrap();
+        assert!(!sequences.inflight_seen.load(Ordering::Relaxed));
+        assert!(
+            sequences
+                .active_request_counts()
+                .values()
+                .all(|&count| count == 0)
+        );
+
+        add("req-c", worker_b);
+        assert!(sequences.inflight_seen.load(Ordering::Relaxed));
     }
 
     #[test]
