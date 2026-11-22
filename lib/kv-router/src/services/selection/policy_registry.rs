@@ -162,9 +162,9 @@ impl WorkerSelectionPolicyRegistry {
         let Some(provider) = self.providers.get(DEFAULT_DECODE_POLICY_TYPE) else {
             return Ok(None);
         };
-        provider(&WorkerSelectionPolicyParameters::new(serde_yaml::Value::Mapping(
-            serde_yaml::Mapping::new(),
-        )))
+        provider(&WorkerSelectionPolicyParameters::new(
+            serde_yaml::Value::Mapping(serde_yaml::Mapping::new()),
+        ))
         .map(Some)
         .map_err(|source| WorkerSelectionPolicyRegistryError::Provider {
             policy_type: DEFAULT_DECODE_POLICY_TYPE.to_owned(),

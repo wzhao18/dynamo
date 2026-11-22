@@ -1514,8 +1514,10 @@ where
         // the store): the leading blocks of this prompt that were routed earlier to any worker.
         let global_prefix = if self.worker_type() == "prefill" {
             dynamo_kv_router::scheduling::global_prefix::registry().map(|registry| {
-                let chain = dynamo_kv_router::scheduling::global_prefix::chain_hashes(&block_hashes);
-                let (blocks, tokens) = registry.resident_prefix(&chain, self.block_size, isl_tokens);
+                let chain =
+                    dynamo_kv_router::scheduling::global_prefix::chain_hashes(&block_hashes);
+                let (blocks, tokens) =
+                    registry.resident_prefix(&chain, self.block_size, isl_tokens);
                 (registry, chain, blocks, tokens)
             })
         } else {

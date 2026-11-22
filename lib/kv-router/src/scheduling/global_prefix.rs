@@ -153,7 +153,10 @@ pub fn enable(ttl_secs: u64) {
         return;
     }
     let registry = REGISTRY.get_or_init(|| {
-        tracing::info!(ttl_secs, "router global-prefix (shared KV store) model enabled");
+        tracing::info!(
+            ttl_secs,
+            "router global-prefix (shared KV store) model enabled"
+        );
         GlobalPrefixRegistry::new(ttl_secs)
     });
     if registry.ttl_secs != ttl_secs {
@@ -192,12 +195,24 @@ mod tests {
         let registry = GlobalPrefixRegistry::new(60);
         registry.insert(&chain(&[1, 2, 3]), 3 * 16 + 5);
         // All full blocks resident: extends the earlier prompt, tokens run to its length.
-        assert_eq!(registry.resident_prefix(&chain(&[1, 2, 3]), 16, 60), (3, 53));
-        assert_eq!(registry.resident_prefix(&chain(&[1, 2, 3, 4]), 16, 70), (3, 48));
-        assert_eq!(registry.resident_prefix(&chain(&[1, 9, 3]), 16, 60), (1, 16));
+        assert_eq!(
+            registry.resident_prefix(&chain(&[1, 2, 3]), 16, 60),
+            (3, 53)
+        );
+        assert_eq!(
+            registry.resident_prefix(&chain(&[1, 2, 3, 4]), 16, 70),
+            (3, 48)
+        );
+        assert_eq!(
+            registry.resident_prefix(&chain(&[1, 9, 3]), 16, 60),
+            (1, 16)
+        );
         assert_eq!(registry.resident_prefix(&chain(&[7, 1, 2]), 16, 60), (0, 0));
         // A shorter prompt than the routed one is capped at its own length.
-        assert_eq!(registry.resident_prefix(&chain(&[1, 2, 3]), 16, 50), (3, 50));
+        assert_eq!(
+            registry.resident_prefix(&chain(&[1, 2, 3]), 16, 50),
+            (3, 50)
+        );
     }
 
     #[test]

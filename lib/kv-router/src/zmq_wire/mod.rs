@@ -258,7 +258,8 @@ impl ZmqEventNormalizer {
                 if self.partial_hashes.is_empty() || block_hashes.is_empty() {
                     return Ok(());
                 }
-                block_hashes.retain(|hash| !self.partial_hashes.remove(&(worker, (*hash).into_u64())));
+                block_hashes
+                    .retain(|hash| !self.partial_hashes.remove(&(worker, (*hash).into_u64())));
                 if block_hashes.is_empty() {
                     return Err(ZmqEventFilterReason::PartialBlock);
                 }

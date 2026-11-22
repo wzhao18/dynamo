@@ -58,7 +58,10 @@ impl Default for Parameters {
 
 impl Parameters {
     fn validate(&self) -> Result<(), WorkerSelectionPolicyProviderError> {
-        for (name, value) in [("per_request", self.per_request), ("per_mtok", self.per_mtok)] {
+        for (name, value) in [
+            ("per_request", self.per_request),
+            ("per_mtok", self.per_mtok),
+        ] {
             if !value.is_finite() || value < 0.0 {
                 return Err(WorkerSelectionPolicyProviderError::new(format!(
                     "{name} must be a finite number >= 0"
@@ -218,9 +221,30 @@ mod tests {
 
     #[test]
     fn validation_rejects_bad_parameters() {
-        assert!(Parameters { per_request: -1.0, per_mtok: 0.26 }.validate().is_err());
-        assert!(Parameters { per_request: f64::NAN, per_mtok: 0.26 }.validate().is_err());
-        assert!(Parameters { per_request: 0.0, per_mtok: 0.0 }.validate().is_err());
+        assert!(
+            Parameters {
+                per_request: -1.0,
+                per_mtok: 0.26
+            }
+            .validate()
+            .is_err()
+        );
+        assert!(
+            Parameters {
+                per_request: f64::NAN,
+                per_mtok: 0.26
+            }
+            .validate()
+            .is_err()
+        );
+        assert!(
+            Parameters {
+                per_request: 0.0,
+                per_mtok: 0.0
+            }
+            .validate()
+            .is_err()
+        );
         assert!(Parameters::default().validate().is_ok());
     }
 

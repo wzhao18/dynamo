@@ -304,8 +304,17 @@ mod tests {
 
     const BS: u32 = 16384;
 
-    fn rank(device_overlap_blocks: f64, active_prefill_tokens: usize, active_requests: usize) -> Rank {
-        rank_on(0, device_overlap_blocks, active_prefill_tokens, active_requests)
+    fn rank(
+        device_overlap_blocks: f64,
+        active_prefill_tokens: usize,
+        active_requests: usize,
+    ) -> Rank {
+        rank_on(
+            0,
+            device_overlap_blocks,
+            active_prefill_tokens,
+            active_requests,
+        )
     }
 
     fn rank_on(
@@ -348,7 +357,11 @@ mod tests {
             node_read_gbps: 0.0,
             ..Parameters::default()
         };
-        let ranks = [rank_on(7, 0.0, 0, 0), rank_on(7, 0.0, 0, 9), rank_on(9, 0.0, 0, 0)];
+        let ranks = [
+            rank_on(7, 0.0, 0, 0),
+            rank_on(7, 0.0, 0, 9),
+            rank_on(9, 0.0, 0, 0),
+        ];
         let costs = row_costs(&p, 140_000, BS, 131_072, &ranks);
         assert_eq!(costs[0], costs[2], "{costs:?}");
     }
@@ -401,7 +414,11 @@ mod tests {
     #[test]
     fn cold_prompt_goes_to_least_backlog() {
         let p = Parameters::default();
-        let ranks = [rank(0.0, 20_000, 2), rank(0.0, 5_000, 3), rank(0.0, 60_000, 1)];
+        let ranks = [
+            rank(0.0, 20_000, 2),
+            rank(0.0, 5_000, 3),
+            rank(0.0, 60_000, 1),
+        ];
         let costs = row_costs(&p, 90_000, BS, 0, &ranks);
         assert_eq!(select_row(&costs, &ranks), Some(1), "{costs:?}");
     }
@@ -418,10 +435,17 @@ mod tests {
             + p.per_request;
         // Idle engine: the request itself raises the lockstep maximum by its own cost.
         // One sharer (this load) of the worker's store read bandwidth.
-        let transfer = (p.load_state_bytes + p.load_bytes_per_token * 131_072.0) / (p.node_read_gbps * 1e6);
-        let expected = p.load_fixed + p.load_per_token * 131_072.0 + transfer + request
+        let transfer =
+            (p.load_state_bytes + p.load_bytes_per_token * 131_072.0) / (p.node_read_gbps * 1e6);
+        let expected = p.load_fixed
+            + p.load_per_token * 131_072.0
+            + transfer
+            + request
             + p.balance_weight * request;
-        assert!((costs[0] - expected).abs() < 1e-6, "{costs:?} vs {expected}");
+        assert!(
+            (costs[0] - expected).abs() < 1e-6,
+            "{costs:?} vs {expected}"
+        );
         let cold = p.uncached * 140_000.0
             + p.uncached_times_context * 140_000.0 * 70_000.0
             + p.per_request;
