@@ -25,10 +25,13 @@
 //! The default selector balances the KV footprint alone and charges active requests nothing
 //! (`decode_active_request_weight` 0). On Kimi K3.1 DCP4xDP4 decode (VR200, AgentX c576/c608) the
 //! busiest rank then carries ~7 requests above the mean (1.17x p50 max/mean), what count-blind
-//! placement gives, and every rank launches at the busiest rank's size. Defaults: 0.094 ms per
-//! request (served lockstep step slope below 64 requests per rank, c608 minutes 10-60; 0.095 at
-//! c576) and 0.26 ms per million context tokens (decode indexer logits scale with summed context
-//! per rank). With these, one request outweighs ~0.36M tokens of footprint, so the count decides.
+//! placement gives, and every rank launches at the busiest rank's size: the footprint selector
+//! equalises tokens (context max/mean 1.03) while counts drift apart (max/mean 1.15; ranks with
+//! short prompts collect requests). Defaults (c608 SOL ledger, decode-dp-balance): 0.0945 ms per
+//! request (served lockstep step slope below 64 requests per rank) and 0.0703 ms per million
+//! booked context tokens, i.e. one request = 82 blocks of 16384 tokens (1.34M tokens). In the
+//! served-trace replay that weight leaves an excess of 1.37 requests vs 2.44 at 0.26 ms/Mtok and
+//! 1.20 for pure in-flight join-shortest-queue.
 //!
 //! Placement only: no request's computation changes.
 
@@ -59,8 +62,8 @@ struct Parameters {
 impl Default for Parameters {
     fn default() -> Self {
         Self {
-            per_request: 0.094,
-            per_mtok: 0.26,
+            per_request: 0.0945,
+            per_mtok: 0.0703,
         }
     }
 }
@@ -144,14 +147,22 @@ impl WorkerPicker for DecodeStepCostPicker {
         let costs = row_costs(&self.parameters, context.block_size(), &ranks);
         let row = select_row(&costs, &ranks)
             .ok_or_else(|| WorkerSelectionPolicyError::failed("no eligible worker"))?;
-        log_pick(input.candidates(), &ranks, &costs, row);
+        log_pick(context, input.candidates(), &ranks, &costs, row);
         Ok(row)
     }
 }
 
-/// One INFO line per decode placement: the chosen rank and every rank's router in-flight count
-/// before admission, ordered by (worker_id, dp_rank), so a served run can measure the spread.
-fn log_pick(candidates: &[ScoredWorkerCandidate], ranks: &[Rank], costs: &[f64], row: usize) {
+/// One INFO line per decode placement (joinable to the selector's "Selected worker" line by
+/// request_id): the chosen rank and, for every candidate rank ordered by (worker_id, dp_rank), the
+/// router in-flight count (routed and not finished, including requests still pulling KV) and the
+/// booked KV blocks before admission.
+fn log_pick(
+    context: &WorkerSelectionContext<'_>,
+    candidates: &[ScoredWorkerCandidate],
+    ranks: &[Rank],
+    costs: &[f64],
+    row: usize,
+) {
     let mut order: Vec<usize> = (0..ranks.len()).collect();
     if candidates.len() == ranks.len() {
         order.sort_by_key(|&i| {
@@ -159,7 +170,12 @@ fn log_pick(candidates: &[ScoredWorkerCandidate], ranks: &[Rank], costs: &[f64],
             (worker.worker_id, worker.dp_rank)
         });
     }
+    let request_blocks = context.request_blocks() as f64;
     let active: Vec<usize> = order.iter().map(|&i| ranks[i].active_requests).collect();
+    let booked_blocks: Vec<u64> = order
+        .iter()
+        .map(|&i| (ranks[i].projected_blocks - request_blocks).max(0.0).round() as u64)
+        .collect();
     let (worker_id, dp_rank) = candidates
         .get(row)
         .map(|candidate| {
@@ -168,10 +184,13 @@ fn log_pick(candidates: &[ScoredWorkerCandidate], ranks: &[Rank], costs: &[f64],
         })
         .unwrap_or((0, 0));
     tracing::info!(
+        request_id = context.request_id(),
         worker_id,
         dp_rank,
         cost_ms = costs[row],
         active_requests = ?active,
+        booked_blocks = ?booked_blocks,
+        request_blocks = context.request_blocks(),
         "decode-step-cost pick"
     );
 }
@@ -220,8 +239,11 @@ mod tests {
     #[test]
     fn default_coefficients_match_the_served_fit() {
         let p = Parameters::default();
-        assert_eq!(p.per_request, 0.094);
-        assert_eq!(p.per_mtok, 0.26);
+        assert_eq!(p.per_request, 0.0945);
+        assert_eq!(p.per_mtok, 0.0703);
+        // 82 blocks of 16384 tokens per request (the stock-units weight of the replay).
+        let blocks_per_request = p.per_request / p.per_mtok * 1e6 / BS as f64;
+        assert!((blocks_per_request - 82.0).abs() < 0.1, "{blocks_per_request}");
     }
 
     #[test]
@@ -244,7 +266,7 @@ mod tests {
 
     #[test]
     fn count_and_footprint_trade_off_at_the_fitted_rate() {
-        // 1 request = per_request / per_mtok million tokens = 0.36M tokens ~ 22 blocks.
+        // 1 request = per_request / per_mtok million tokens = 1.34M tokens ~ 82 blocks.
         let p = Parameters::default();
         let blocks_per_request = p.per_request / p.per_mtok * 1e6 / BS as f64;
         let ranks = [r(41, 400.0), r(40, 400.0 + blocks_per_request + 1.0)];
