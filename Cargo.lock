@@ -2461,6 +2461,9 @@ dependencies = [
  "dynamo-kv-router",
  "serde",
  "tempfile",
+ "tokio",
+ "tokio-util",
+ "tracing",
 ]
 
 [[package]]
