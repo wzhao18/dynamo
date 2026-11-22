@@ -26,7 +26,14 @@
 //!   a rank above the current busiest rank's backlog costs `balance_weight` times the excess.
 //!
 //! `cost(r) = max(load(r), backlog(r)) + request(r) + balance_weight * max(0, backlog(r) +
-//! request(r) - max_backlog) + kv(r)`. Ties resolve to the rank with fewer active requests.
+//! request(r) - max_backlog) + kv(r)`.
+//!
+//! Near ties: every rank with `cost(r) <= min cost + per_request` is a candidate, and the
+//! candidate with the least `backlog(r)` (queued prefill cost) wins; remaining ties go to fewer
+//! active requests, then to the lower row. `per_request` is the policy's fixed cost of one more
+//! routed request, its smallest cost quantum, so rows closer than that are not separated by the
+//! model. It is far below the store-load term (`load_fixed`), so near ties never trade a cache
+//! hit for balance. A unique best (no other row within `per_request`) is picked as before.
 //!
 //! With `store_retention_secs > 0` the policy also enables the router's global-prefix store model
 //! (blocks routed earlier to any worker are resident in the store for that long), which supplies
@@ -221,12 +228,18 @@ fn row_costs(
         .collect()
 }
 
-fn select_row(costs: &[f64], ranks: &[Rank]) -> Option<usize> {
-    (0..costs.len()).min_by(|&a, &b| {
-        costs[a]
-            .total_cmp(&costs[b])
-            .then(ranks[a].active_requests.cmp(&ranks[b].active_requests))
-    })
+fn select_row(parameters: &Parameters, costs: &[f64], ranks: &[Rank]) -> Option<usize> {
+    let best = costs.iter().copied().min_by(f64::total_cmp)?;
+    let band = best + parameters.per_request;
+    (0..costs.len())
+        .filter(|&r| costs[r] <= band)
+        .min_by(|&a, &b| {
+            parameters
+                .backlog_ms(&ranks[a])
+                .total_cmp(&parameters.backlog_ms(&ranks[b]))
+                .then(ranks[a].active_requests.cmp(&ranks[b].active_requests))
+                .then(a.cmp(&b))
+        })
 }
 
 struct PrefillStepCostPicker {
@@ -268,7 +281,7 @@ impl WorkerPicker for PrefillStepCostPicker {
             context.shared_prefix_tokens(),
             &ranks,
         );
-        select_row(&costs, &ranks)
+        select_row(&self.parameters, &costs, &ranks)
             .ok_or_else(|| WorkerSelectionPolicyError::failed("no eligible worker"))
     }
 }
@@ -335,7 +348,7 @@ mod tests {
             rank_on(9, 0.0, 30_000, 1),
         ];
         let costs = row_costs(&p, 140_000, BS, 131_072, &ranks);
-        assert_eq!(select_row(&costs, &ranks), Some(2), "{costs:?}");
+        assert_eq!(select_row(&p, &costs, &ranks), Some(2), "{costs:?}");
         // Seven sharers instead of two: five extra transfers of ~2.8 GB at 16 GB/s.
         let bytes = p.load_state_bytes + p.load_bytes_per_token * 131_072.0;
         let expected = 5.0 * bytes / (p.node_read_gbps * 1e6);
@@ -364,10 +377,10 @@ mod tests {
         hit.active_blocks = 6.0;
         let ranks = [rank_on(7, 0.0, 0, 0), hit];
         let costs = row_costs(&p, 140_000, BS, 131_072, &ranks);
-        assert_eq!(select_row(&costs, &ranks), Some(0), "{costs:?}");
+        assert_eq!(select_row(&p, &costs, &ranks), Some(0), "{costs:?}");
         // Without the capacity bound the device hit wins.
         let costs = row_costs(&Parameters::default(), 140_000, BS, 131_072, &ranks);
-        assert_eq!(select_row(&costs, &ranks), Some(1), "{costs:?}");
+        assert_eq!(select_row(&p, &costs, &ranks), Some(1), "{costs:?}");
     }
 
     #[test]
@@ -377,7 +390,7 @@ mod tests {
         let ranks = [rank(0.0, 0, 0), rank(8.0, 0, 0)];
         let costs = row_costs(&p, 140_000, BS, 131_072, &ranks);
         assert!(costs[1] < costs[0], "{costs:?}");
-        assert_eq!(select_row(&costs, &ranks), Some(1));
+        assert_eq!(select_row(&p, &costs, &ranks), Some(1));
     }
 
     #[test]
@@ -386,7 +399,7 @@ mod tests {
         // The hit rank has a cold 100K prompt queued (~2.5 s + context), more than a store load.
         let ranks = [rank(0.0, 0, 0), rank(8.0, 100_000, 1)];
         let costs = row_costs(&p, 140_000, BS, 131_072, &ranks);
-        assert_eq!(select_row(&costs, &ranks), Some(0), "{costs:?}");
+        assert_eq!(select_row(&p, &costs, &ranks), Some(0), "{costs:?}");
     }
 
     #[test]
@@ -395,7 +408,7 @@ mod tests {
         // One continuation (9K fresh) queued on the hit rank: still sooner than a store load.
         let ranks = [rank(0.0, 0, 0), rank(8.0, 9_000, 1)];
         let costs = row_costs(&p, 140_000, BS, 131_072, &ranks);
-        assert_eq!(select_row(&costs, &ranks), Some(1), "{costs:?}");
+        assert_eq!(select_row(&p, &costs, &ranks), Some(1), "{costs:?}");
     }
 
     #[test]
@@ -403,7 +416,7 @@ mod tests {
         let p = Parameters::default();
         let ranks = [rank(0.0, 20_000, 2), rank(0.0, 5_000, 3), rank(0.0, 60_000, 1)];
         let costs = row_costs(&p, 90_000, BS, 0, &ranks);
-        assert_eq!(select_row(&costs, &ranks), Some(1), "{costs:?}");
+        assert_eq!(select_row(&p, &costs, &ranks), Some(1), "{costs:?}");
     }
 
     #[test]
@@ -426,6 +439,47 @@ mod tests {
             + p.uncached_times_context * 140_000.0 * 70_000.0
             + p.per_request;
         assert!(costs[0] < cold, "{costs:?} vs cold {cold}");
+    }
+
+    #[test]
+    fn near_tie_goes_to_least_queued_prefill() {
+        let p = Parameters::default();
+        let eps = p.per_request;
+        // Backlogs: rank 0 20K tokens, rank 1 5K, rank 2 10K (one request each).
+        let ranks = [rank(0.0, 20_000, 1), rank(0.0, 5_000, 1), rank(0.0, 10_000, 1)];
+        assert_eq!(select_row(&p, &[100.0, 100.0 + eps, 100.0 + eps / 2.0], &ranks), Some(1));
+        // Rank 1 just outside the band: least backlog among the remaining near ties.
+        assert_eq!(select_row(&p, &[100.0, 100.0 + eps + 1e-9, 100.0 + eps / 2.0], &ranks), Some(2));
+        // Equal backlog: fewer active requests, then the lower row.
+        let same = [rank(0.0, 5_000, 1), rank(0.0, 5_000, 1), rank(0.0, 5_000, 1)];
+        assert_eq!(select_row(&p, &[101.0, 100.0, 101.0], &same), Some(0));
+    }
+
+    #[test]
+    fn unique_best_is_unchanged() {
+        let p = Parameters::default();
+        let eps = p.per_request;
+        // The best row has the largest backlog, but no other row is within per_request.
+        let ranks = [rank(0.0, 60_000, 4), rank(0.0, 0, 0), rank(0.0, 0, 0)];
+        let costs = [100.0, 100.0 + eps + 1e-6, 500.0];
+        assert_eq!(select_row(&p, &costs, &ranks), Some(0));
+        // Full row costs: the device hit beats an idle cold rank by a store load, far above eps.
+        let ranks = [rank(0.0, 0, 0), rank(8.0, 9_000, 1)];
+        let costs = row_costs(&p, 140_000, BS, 131_072, &ranks);
+        assert!(costs[0] - costs[1] > eps, "{costs:?}");
+        assert_eq!(select_row(&p, &costs, &ranks), Some(1), "{costs:?}");
+    }
+
+    #[test]
+    fn equal_costs_are_stable() {
+        let p = Parameters::default();
+        let ranks = [rank(0.0, 0, 0), rank(0.0, 0, 0), rank(0.0, 0, 0), rank(0.0, 0, 0)];
+        let costs = row_costs(&p, 50_000, BS, 0, &ranks);
+        assert!(costs.iter().all(|&c| c == costs[0]), "{costs:?}");
+        for _ in 0..3 {
+            assert_eq!(select_row(&p, &costs, &ranks), Some(0));
+        }
+        assert_eq!(select_row(&p, &[], &[]), None);
     }
 
     #[test]
