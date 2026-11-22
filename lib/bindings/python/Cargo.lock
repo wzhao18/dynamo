@@ -2101,6 +2101,7 @@ version = "1.5.0"
 dependencies = [
  "dynamo-kv-router",
  "serde",
+ "tracing",
 ]
 
 [[package]]
