@@ -161,6 +161,12 @@ impl WorkerSelectionContext<'_> {
         self.request_id
     }
 
+    /// Return whether the selected worker will be booked for this request (`false` for a
+    /// query-only selection). Stateful pickers update their state only for tracked selections.
+    pub fn is_tracked(&self) -> bool {
+        self.request.mode.is_tracked()
+    }
+
     /// Return the incoming prompt size in tokens.
     pub fn isl_tokens(&self) -> usize {
         self.request.isl_tokens
@@ -1013,6 +1019,46 @@ mod tests {
                 16,
             ))
             .unwrap();
+    }
+
+    #[test]
+    fn custom_picker_sees_whether_the_selection_is_tracked() {
+        struct TrackedPicker(Vec<bool>);
+
+        impl WorkerPicker for TrackedPicker {
+            fn pick(
+                &mut self,
+                context: &WorkerSelectionContext<'_>,
+                _input: WorkerInputView<'_>,
+            ) -> Result<usize, WorkerSelectionPolicyError> {
+                self.0.push(context.is_tracked());
+                assert_eq!(self.0.len() == 1, !context.is_tracked());
+                Ok(0)
+            }
+        }
+
+        let workers = HashMap::from([(0, TaintedWorkerConfig::default())]);
+        let policy = WorkerSelectionPolicy::new(
+            KvRouterConfig::default(),
+            "test",
+            Vec::new(),
+            Box::new(TrackedPicker(Vec::new())),
+        );
+        let query = base_request(16);
+        let mut tracked = base_request(16);
+        tracked.mode = crate::scheduling::types::ScheduleMode::Tracked {
+            request_id: "tracked".into(),
+        };
+        for request in [&query, &tracked] {
+            policy
+                .select_worker(WorkerSelectionInput::configured(
+                    &workers,
+                    request,
+                    request.eligibility(),
+                    16,
+                ))
+                .unwrap();
+        }
     }
 
     #[test]

@@ -62,7 +62,7 @@ impl WorkerSelectionPolicyProviderError {
 }
 
 /// Policy type a decode pool uses when no decode policy is selected.
-pub const DEFAULT_DECODE_POLICY_TYPE: &str = "decode-step-cost";
+pub const DEFAULT_DECODE_POLICY_TYPE: &str = "least-active-decode";
 
 /// A startup-only registry of policy types linked into a custom Dynamo image.
 #[derive(Clone, Default)]
@@ -153,9 +153,10 @@ impl WorkerSelectionPolicyRegistry {
         self.resolve_selected(policy_config, selected.as_deref())
     }
 
-    /// Lockstep DP decode is set by its busiest rank, so a decode pool without an explicitly
-    /// selected policy uses the registered decode step-cost policy (default parameters) instead of
-    /// the KV-footprint-only default selector. Builds that link no such policy keep the default.
+    /// Lockstep DP decode is set by its busiest rank, so a disaggregated decode pool without an
+    /// explicitly selected policy uses the registered least-active decode policy (default
+    /// parameters) instead of the KV-overlap/footprint default selector. Builds that link no such
+    /// policy keep the default.
     fn default_decode_policy(
         &self,
     ) -> Result<Option<WorkerSelectionPolicyFactory>, WorkerSelectionPolicyRegistryError> {

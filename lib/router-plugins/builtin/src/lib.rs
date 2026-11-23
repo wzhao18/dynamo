@@ -19,6 +19,7 @@
 //! it; every policy registered here is compiled into every artifact that links this crate.
 
 mod decode_step_cost;
+mod least_active_decode;
 mod prefill_step_cost;
 mod two_tier_cost_fn;
 
@@ -36,7 +37,8 @@ pub fn register(
 ) -> Result<(), WorkerSelectionPolicyRegistryError> {
     two_tier_cost_fn::register(registry)?;
     prefill_step_cost::register(registry)?;
-    decode_step_cost::register(registry)
+    decode_step_cost::register(registry)?;
+    least_active_decode::register(registry)
 }
 
 #[cfg(test)]
@@ -97,9 +99,9 @@ worker_selection:
     }
 
     /// With only a prefill policy selected (the AgentX render), decode still resolves to a
-    /// policy factory: the decode step-cost default, not the KV-footprint-only selector.
+    /// policy factory: the least-active decode default, not the KV-overlap/footprint selector.
     #[test]
-    fn decode_defaults_to_step_cost_when_unselected() {
+    fn decode_defaults_to_least_active_when_unselected() {
         let (config, resolved) = resolve(
             r#"
 worker_selection:
@@ -129,6 +131,50 @@ worker_selection:
                 .unwrap()
                 .is_none()
         );
+    }
+
+    /// The policy YAML can select either decode policy explicitly, with parameters.
+    #[test]
+    fn resolves_explicit_decode_policy_yaml() {
+        for yaml in [
+            r#"
+worker_selection:
+  decode: lad
+  instances:
+    - name: lad
+      type: least-active-decode
+      parameters:
+        affinity_slack: 2
+        session_ttl_secs: 1800
+"#,
+            r#"
+worker_selection:
+  decode: dsc
+  instances:
+    - name: dsc
+      type: decode-step-cost
+"#,
+        ] {
+            let (config, resolved) = resolve(yaml);
+            let factory = resolved.unwrap().expect("decode instance resolves");
+            factory(
+                &config,
+                WorkerType::Decode,
+                RoutingPartitionRef::new("model", "default"),
+            );
+        }
+        let (_config, resolved) = resolve(
+            r#"
+worker_selection:
+  decode: lad
+  instances:
+    - name: lad
+      type: least-active-decode
+      parameters:
+        affinity_slack: -1
+"#,
+        );
+        assert!(resolved.is_err());
     }
 
     /// The OVHFIX-4 prefill routing YAML resolves for the prefill role.

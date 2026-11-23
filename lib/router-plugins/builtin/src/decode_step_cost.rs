@@ -1,8 +1,8 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-//! Decode step-cost worker selection for data-parallel decode engines. It is the default policy
-//! for a decode pool with no explicitly selected policy (see `DEFAULT_DECODE_POLICY_TYPE`).
+//! Decode step-cost worker selection for data-parallel decode engines. Selectable by name; the
+//! default decode policy is `least-active-decode` (see `DEFAULT_DECODE_POLICY_TYPE`).
 //!
 //! Every candidate is one `(worker, dp_rank)` of a lockstep DP decode engine. The ranks step
 //! together, so the slowest rank sets every decode step; the policy therefore places each new
@@ -385,13 +385,14 @@ mod scheduler_tests {
     /// One DP decode engine with `RANKS` ranks; the decode policy comes from the registry with
     /// no decode policy selected, i.e. the default the frontend resolves.
     fn harness() -> Harness {
+        // Every builtin policy, as the frontend links them.
         let mut registry = WorkerSelectionPolicyRegistry::default();
-        super::register(&mut registry).unwrap();
+        crate::register(&mut registry).unwrap();
         let config = KvRouterConfig::default();
         let factory = registry
             .resolve_for_worker_type(&config, WorkerType::Decode)
             .unwrap()
-            .expect("decode resolves to decode-step-cost by default");
+            .expect("decode resolves to the default decode policy");
         let policy = factory(
             &config,
             WorkerType::Decode,
@@ -468,6 +469,18 @@ mod scheduler_tests {
         }
     }
 
+    fn session_request(id: &str, n: u64, session: &str) -> ScheduleRequest {
+        let mut request = request(id, n);
+        request.session_context = Some(dynamo_kv_router::SessionContext::new(
+            session.to_string(),
+            None,
+            None,
+            None,
+            None,
+        ));
+        request
+    }
+
     fn counts(h: &Harness) -> Vec<usize> {
         let by_rank = h.slots.active_request_counts();
         (0..RANKS)
@@ -505,6 +518,47 @@ mod scheduler_tests {
         }
         assert_eq!(chosen, vec![2, 2, 2, 2]);
         assert_eq!(counts(&h), vec![2, 2, 2, 2]);
+    }
+
+    /// The default decode policy keeps a session's turns on its rank while that rank is within
+    /// mean + 1 active requests, and moves it to the least-active rank beyond that.
+    #[tokio::test]
+    async fn session_turns_stay_on_their_rank_within_the_load_bound() {
+        let h = harness();
+        let first = h
+            .scheduler
+            .schedule_request(session_request("s-0", 0, "sess"))
+            .await
+            .unwrap()
+            .best_worker;
+        for n in 1..4u64 {
+            h.scheduler
+                .schedule_request(request(&format!("o-{n}"), n))
+                .await
+                .unwrap();
+        }
+        assert_eq!(counts(&h), vec![1, 1, 1, 1]);
+        // Counts 1/1/1/1, then 2/1/1/1 with mean 1.25: both within the bound.
+        for n in 1..3u64 {
+            let worker = h
+                .scheduler
+                .schedule_request(session_request(&format!("s-{n}"), 10 + n, "sess"))
+                .await
+                .unwrap()
+                .best_worker;
+            assert_eq!(worker, first);
+        }
+        // The session's rank now holds 3 vs mean 1.5: the next turn moves.
+        let moved = h
+            .scheduler
+            .schedule_request(session_request("s-3", 13, "sess"))
+            .await
+            .unwrap()
+            .best_worker;
+        assert_ne!(moved, first);
+        let mut sorted = counts(&h);
+        sorted.sort_unstable();
+        assert_eq!(sorted, vec![1, 1, 2, 3]);
     }
 
     /// Sequential back-to-back selections spread the same way.
