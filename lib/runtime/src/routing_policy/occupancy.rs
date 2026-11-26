@@ -2,12 +2,15 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use std::{
-    collections::HashSet,
+    collections::{HashSet, VecDeque},
     sync::{
         Arc,
         atomic::{AtomicU64, Ordering},
     },
+    time::{Duration, Instant},
 };
+
+use tokio::sync::Notify;
 
 use dashmap::{DashMap, mapref::entry::Entry};
 
@@ -52,6 +55,71 @@ pub struct RoutingOccupancyState {
     counts: DashMap<u64, Arc<AtomicU64>>,
     discovered: parking_lot::RwLock<HashSet<u64>>,
     admission_lock: parking_lot::Mutex<()>,
+    /// FIFO of requests waiting for a worker below the admission cap.
+    ///
+    /// Lock order: `admission_lock` before `admission_queue`. Only the head waiter
+    /// may take a freed slot, so admission is strictly first-come first-served.
+    admission_queue: parking_lot::Mutex<AdmissionQueue>,
+}
+
+/// What a capped selection does when every candidate is at the cap.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum AdmissionFullPolicy {
+    /// Wait in FIFO order until a reservation is released.
+    #[default]
+    Wait,
+    /// Fail immediately.
+    Reject,
+}
+
+/// How a capped selection was admitted.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct AdmissionOutcome {
+    /// The request waited in the admission queue.
+    pub queued: bool,
+    /// Queue depth (including this request) when it was enqueued; 0 if never queued.
+    pub queue_depth_at_enqueue: usize,
+    /// Queue depth left behind when this request was admitted.
+    pub queue_depth_after: usize,
+    /// Time from the first admission attempt to the reservation.
+    pub wait: Duration,
+}
+
+#[derive(Debug, Default)]
+struct AdmissionQueue {
+    next_ticket: u64,
+    waiters: VecDeque<(u64, Arc<Notify>)>,
+}
+
+impl AdmissionQueue {
+    fn wake_head(&self) {
+        if let Some((_, notify)) = self.waiters.front() {
+            notify.notify_one();
+        }
+    }
+}
+
+/// A queued waiter. Dropping it (cancellation, timeout, disconnect, selection
+/// error) leaves the queue and hands the head position to the next waiter.
+struct AdmissionTicket<'a> {
+    state: &'a RoutingOccupancyState,
+    id: u64,
+    notify: Arc<Notify>,
+    armed: bool,
+}
+
+impl Drop for AdmissionTicket<'_> {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        let mut queue = self.state.admission_queue.lock();
+        let was_head = queue.waiters.front().is_some_and(|(id, _)| *id == self.id);
+        queue.waiters.retain(|(id, _)| *id != self.id);
+        if was_head {
+            queue.wake_head();
+        }
+    }
 }
 
 impl RoutingOccupancyState {
@@ -151,6 +219,7 @@ impl RoutingOccupancyState {
     pub(crate) fn release(&self, worker_id: u64, counter: &Arc<AtomicU64>) {
         let _admission = self.admission_lock.lock();
         self.decrement_locked(worker_id, counter);
+        self.admission_queue.lock().wake_head();
     }
 
     pub(crate) fn decrement(&self, worker_id: u64) {
@@ -158,6 +227,116 @@ impl RoutingOccupancyState {
         let counter = self.counts.get(&worker_id).map(|entry| entry.clone());
         if let Some(counter) = counter {
             self.decrement_locked(worker_id, &counter);
+        }
+        self.admission_queue.lock().wake_head();
+    }
+
+    /// Number of requests waiting in the admission queue.
+    pub fn admission_queue_depth(&self) -> usize {
+        self.admission_queue.lock().waiters.len()
+    }
+
+    /// Capped, FIFO-fair variant of [`Self::select_and_reserve_with`].
+    ///
+    /// Only candidates whose load is below `cap` are offered to `select`. When none
+    /// is (or earlier requests are already queued), `Wait` parks the caller in a
+    /// FIFO and retries when a reservation is released, discovery changes, or the
+    /// waiter ahead leaves; `Reject` returns `full()` at once. Candidates are
+    /// re-read on every attempt. Dropping the returned future leaves the queue.
+    pub async fn select_and_reserve_capped_with<E>(
+        self: &Arc<Self>,
+        cap: u64,
+        policy: AdmissionFullPolicy,
+        candidates: impl Fn() -> Result<Vec<u64>, E>,
+        select: impl Fn(&[u64], &dyn Fn(u64) -> u64) -> Result<u64, E>,
+        full: impl FnOnce() -> E,
+    ) -> Result<(OccupancySelection, AdmissionOutcome), E> {
+        let cap = cap.max(1);
+        let started = Instant::now();
+        let mut ticket: Option<AdmissionTicket<'_>> = None;
+        let mut full = Some(full);
+        let mut depth_at_enqueue = 0;
+        loop {
+            let notify = {
+                let _admission = self.admission_lock.lock();
+                let candidates = candidates()?;
+                let eligible = candidates
+                    .iter()
+                    .copied()
+                    .filter(|worker_id| self.load(*worker_id) < cap)
+                    .collect::<Vec<_>>();
+                let mut queue = self.admission_queue.lock();
+                let at_head = match &ticket {
+                    None => queue.waiters.is_empty(),
+                    Some(ticket) => queue
+                        .waiters
+                        .front()
+                        .is_some_and(|(id, _)| *id == ticket.id),
+                };
+                if at_head && !eligible.is_empty() {
+                    let worker_id = select(&eligible, &|worker_id| self.load(worker_id))?;
+                    debug_assert!(eligible.contains(&worker_id));
+                    let counter = self.increment_locked(worker_id);
+                    let load = counter.load(Ordering::Relaxed);
+                    let queued = if let Some(mut ticket) = ticket.take() {
+                        queue.waiters.pop_front();
+                        ticket.armed = false;
+                        true
+                    } else {
+                        false
+                    };
+                    // More than one slot may have opened; let the next waiter look.
+                    queue.wake_head();
+                    let queue_depth_after = queue.waiters.len();
+                    drop(queue);
+                    let selection = OccupancySelection {
+                        worker_id,
+                        candidate_count: candidates.len(),
+                        load,
+                        reservation: OccupancyReservation::from_counter(
+                            Arc::clone(self),
+                            worker_id,
+                            counter,
+                        ),
+                    };
+                    return Ok((
+                        selection,
+                        AdmissionOutcome {
+                            queued,
+                            queue_depth_at_enqueue: depth_at_enqueue,
+                            queue_depth_after,
+                            wait: started.elapsed(),
+                        },
+                    ));
+                }
+                match &ticket {
+                    Some(ticket) => Arc::clone(&ticket.notify),
+                    None => {
+                        if policy == AdmissionFullPolicy::Reject {
+                            let full = full.take().expect("reject returns on first attempt");
+                            return Err(full());
+                        }
+                        let id = queue.next_ticket;
+                        queue.next_ticket += 1;
+                        let notify = Arc::new(Notify::new());
+                        queue.waiters.push_back((id, Arc::clone(&notify)));
+                        depth_at_enqueue = queue.waiters.len();
+                        tracing::debug!(
+                            cap,
+                            queue_depth = depth_at_enqueue,
+                            "admission queue: every candidate at cap, waiting"
+                        );
+                        ticket = Some(AdmissionTicket {
+                            state: self.as_ref(),
+                            id,
+                            notify: Arc::clone(&notify),
+                            armed: true,
+                        });
+                        notify
+                    }
+                }
+            };
+            notify.notified().await;
         }
     }
 
@@ -177,6 +356,9 @@ impl RoutingOccupancyState {
         self.counts.retain(|worker_id, count| {
             live.contains(worker_id) || count.load(Ordering::Relaxed) != 0
         });
+        drop(live);
+        // A newly discovered worker may be below the cap.
+        self.admission_queue.lock().wake_head();
     }
 
     #[cfg(test)]
@@ -222,6 +404,7 @@ impl OccupancyReservation {
         let _admission = self.state.admission_lock.lock();
         let next = self.state.increment_locked(worker_id);
         self.state.decrement_locked(self.worker_id, &self.counter);
+        self.state.admission_queue.lock().wake_head();
         self.worker_id = worker_id;
         self.counter = next;
         self.load()
@@ -304,6 +487,214 @@ mod tests {
 
         drop(reservation);
         assert_eq!(state.load(2), 0);
+    }
+
+    fn least_loaded(eligible: &[u64], load: &dyn Fn(u64) -> u64) -> Result<u64, &'static str> {
+        eligible
+            .iter()
+            .copied()
+            .min_by_key(|worker_id| (load(*worker_id), *worker_id))
+            .ok_or("no candidates")
+    }
+
+    async fn capped(
+        state: &Arc<RoutingOccupancyState>,
+        workers: &'static [u64],
+        cap: u64,
+    ) -> Result<(OccupancySelection, AdmissionOutcome), &'static str> {
+        state
+            .select_and_reserve_capped_with(
+                cap,
+                AdmissionFullPolicy::Wait,
+                || Ok(workers.to_vec()),
+                least_loaded,
+                || "full",
+            )
+            .await
+    }
+
+    #[tokio::test]
+    async fn capped_admits_below_cap_without_queueing() {
+        let state = Arc::new(RoutingOccupancyState::default());
+        state.retain(&[1, 2]);
+        let (a, outcome_a) = capped(&state, &[1, 2], 1).await.unwrap();
+        let (b, outcome_b) = capped(&state, &[1, 2], 1).await.unwrap();
+        assert_ne!(a.worker_id(), b.worker_id());
+        assert!(!outcome_a.queued && !outcome_b.queued);
+        assert_eq!(outcome_a.queue_depth_at_enqueue, 0);
+        assert_eq!([state.load(1), state.load(2)], [1, 1]);
+    }
+
+    #[tokio::test]
+    async fn capped_waits_for_release_and_takes_the_freed_worker() {
+        let state = Arc::new(RoutingOccupancyState::default());
+        state.retain(&[1, 2]);
+        let (a, _) = capped(&state, &[1, 2], 1).await.unwrap();
+        let (_b, _) = capped(&state, &[1, 2], 1).await.unwrap();
+        let freed = a.worker_id();
+
+        let waiter = {
+            let state = Arc::clone(&state);
+            tokio::spawn(async move { capped(&state, &[1, 2], 1).await.unwrap() })
+        };
+        tokio::task::yield_now().await;
+        assert_eq!(state.admission_queue_depth(), 1);
+        assert!(!waiter.is_finished());
+
+        drop(a.into_reservation());
+        let (c, outcome) = waiter.await.unwrap();
+        assert_eq!(c.worker_id(), freed);
+        assert!(outcome.queued);
+        assert_eq!(outcome.queue_depth_at_enqueue, 1);
+        assert_eq!(outcome.queue_depth_after, 0);
+        assert_eq!(state.admission_queue_depth(), 0);
+        assert_eq!([state.load(1), state.load(2)], [1, 1]);
+    }
+
+    #[tokio::test]
+    async fn capped_queue_is_strict_fifo() {
+        let state = Arc::new(RoutingOccupancyState::default());
+        state.retain(&[1]);
+        let (mut held, _) = capped(&state, &[1], 1).await.unwrap();
+        let order = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let mut tasks = Vec::new();
+        for i in 0..5u32 {
+            let state = Arc::clone(&state);
+            let order = Arc::clone(&order);
+            tasks.push(tokio::spawn(async move {
+                let (selection, _) = capped(&state, &[1], 1).await.unwrap();
+                order.lock().push(i);
+                selection.into_reservation()
+            }));
+            // Enqueue in a known order.
+            while state.admission_queue_depth() < (i + 1) as usize {
+                tokio::task::yield_now().await;
+            }
+        }
+        for _ in 0..5 {
+            drop(held.into_reservation());
+            let next = tasks.remove(0).await.unwrap();
+            held = OccupancySelection {
+                worker_id: next.worker_id(),
+                candidate_count: 1,
+                load: next.load(),
+                reservation: next,
+            };
+        }
+        assert_eq!(*order.lock(), vec![0, 1, 2, 3, 4]);
+    }
+
+    #[tokio::test]
+    async fn new_arrival_does_not_overtake_a_queued_request() {
+        use futures::FutureExt;
+        let state = Arc::new(RoutingOccupancyState::default());
+        state.retain(&[1]);
+        let (held, _) = capped(&state, &[1], 1).await.unwrap();
+        let mut first = Box::pin(capped(&state, &[1], 1));
+        assert!((&mut first).now_or_never().is_none());
+        assert_eq!(state.admission_queue_depth(), 1);
+
+        // A slot opens, but the queued head has not run yet: a newcomer must queue.
+        drop(held.into_reservation());
+        let mut newcomer = Box::pin(capped(&state, &[1], 1));
+        assert!((&mut newcomer).now_or_never().is_none());
+        assert_eq!(state.admission_queue_depth(), 2);
+
+        let (a, outcome) = first.await.unwrap();
+        assert!(outcome.queued);
+        drop(a.into_reservation());
+        let (_b, outcome) = newcomer.await.unwrap();
+        assert!(outcome.queued);
+        assert_eq!(outcome.queue_depth_at_enqueue, 2);
+    }
+
+    #[tokio::test]
+    async fn cancelled_waiter_leaves_queue_and_wakes_the_next() {
+        use futures::FutureExt;
+        let state = Arc::new(RoutingOccupancyState::default());
+        state.retain(&[1]);
+        let (held, _) = capped(&state, &[1], 1).await.unwrap();
+        let mut first = Box::pin(capped(&state, &[1], 1));
+        assert!((&mut first).now_or_never().is_none());
+        let mut second = Box::pin(capped(&state, &[1], 1));
+        assert!((&mut second).now_or_never().is_none());
+        assert_eq!(state.admission_queue_depth(), 2);
+
+        // Release wakes the head, then the head is cancelled (client disconnect /
+        // timeout) before it runs: the wake must pass to the next waiter.
+        drop(held.into_reservation());
+        drop(first);
+        assert_eq!(state.admission_queue_depth(), 1);
+        let (selection, outcome) = tokio::time::timeout(Duration::from_secs(5), second)
+            .await
+            .expect("second waiter must be woken")
+            .unwrap();
+        assert_eq!(selection.worker_id(), 1);
+        assert!(outcome.queued);
+        assert_eq!(state.admission_queue_depth(), 0);
+    }
+
+    #[tokio::test]
+    async fn discovery_of_a_new_worker_wakes_the_queue() {
+        use futures::FutureExt;
+        static WORKERS: parking_lot::Mutex<Vec<u64>> = parking_lot::Mutex::new(Vec::new());
+        *WORKERS.lock() = vec![1];
+        let state = Arc::new(RoutingOccupancyState::default());
+        state.retain(&[1]);
+        let candidates = || Ok::<_, &'static str>(WORKERS.lock().clone());
+        let (_held, _) = state
+            .select_and_reserve_capped_with(
+                1,
+                AdmissionFullPolicy::Wait,
+                candidates,
+                least_loaded,
+                || "full",
+            )
+            .await
+            .unwrap();
+        let mut waiter = Box::pin(state.select_and_reserve_capped_with(
+            1,
+            AdmissionFullPolicy::Wait,
+            candidates,
+            least_loaded,
+            || "full",
+        ));
+        assert!((&mut waiter).now_or_never().is_none());
+        WORKERS.lock().push(2);
+        state.retain(&[1, 2]);
+        let (selection, _) = tokio::time::timeout(Duration::from_secs(5), waiter)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(selection.worker_id(), 2);
+    }
+
+    #[tokio::test]
+    async fn reject_policy_fails_fast_when_full() {
+        let state = Arc::new(RoutingOccupancyState::default());
+        state.retain(&[1]);
+        let (_held, _) = capped(&state, &[1], 1).await.unwrap();
+        let result = state
+            .select_and_reserve_capped_with(
+                1,
+                AdmissionFullPolicy::Reject,
+                || Ok(vec![1]),
+                least_loaded,
+                || "full",
+            )
+            .await;
+        assert_eq!(result.err(), Some("full"));
+        assert_eq!(state.admission_queue_depth(), 0);
+    }
+
+    #[tokio::test]
+    async fn cap_two_allows_two_per_worker() {
+        let state = Arc::new(RoutingOccupancyState::default());
+        state.retain(&[1]);
+        let (_a, _) = capped(&state, &[1], 2).await.unwrap();
+        let (_b, outcome) = capped(&state, &[1], 2).await.unwrap();
+        assert!(!outcome.queued);
+        assert_eq!(state.load(1), 2);
     }
 
     #[test]

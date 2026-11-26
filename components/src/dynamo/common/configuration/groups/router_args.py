@@ -38,6 +38,9 @@ _ROUTER_FIELDS: tuple[str, ...] = (
     "active_prefill_tokens_threshold_frac",
     "session_affinity_ttl_secs",
     "session_affinity_mode",
+    "decode_admission_cap",
+    "decode_admission_policy",
+    "decode_admission_max_wait_secs",
 )
 
 _ENFORCE_DISAGG_DEPRECATION = (
@@ -82,13 +85,34 @@ class RouterConfigBase(ConfigBase):
     active_decode_blocks_threshold: Optional[float]
     active_prefill_tokens_threshold: Optional[int]
     active_prefill_tokens_threshold_frac: Optional[float]
+    decode_admission_cap: Optional[int]
+    decode_admission_policy: str
+    decode_admission_max_wait_secs: Optional[float]
 
     def router_kwargs(self) -> dict:
         """Return a dict suitable for ``RouterConfig(mode, kv_config, **kwargs)``."""
         return {f: getattr(self, f) for f in _ROUTER_FIELDS}
 
+    def validate_decode_admission(self) -> None:
+        """Validate the optional decode admission cap."""
+        cap = getattr(self, "decode_admission_cap", None)
+        max_wait = getattr(self, "decode_admission_max_wait_secs", None)
+        if cap is not None and cap < 1:
+            raise ValueError("--router-decode-admission-cap must be >= 1")
+        if max_wait is not None:
+            if cap is None:
+                raise ValueError(
+                    "--router-decode-admission-max-wait-secs requires "
+                    "--router-decode-admission-cap"
+                )
+            if not (math.isfinite(max_wait) and max_wait > 0):
+                raise ValueError(
+                    "--router-decode-admission-max-wait-secs must be a finite value > 0"
+                )
+
     def validate_rejection_thresholds(self) -> None:
         """Validate independently configured busy-worker rejection thresholds."""
+        self.validate_decode_admission()
         decode_threshold = self.active_decode_blocks_threshold
         if decode_threshold is not None and not (
             math.isfinite(decode_threshold) and 0.0 <= decode_threshold <= 1.0
@@ -270,6 +294,48 @@ class RouterArgGroup(ArgGroup):
             ),
             choices=("hard", "soft"),
             dest="session_affinity_mode",
+        )
+        add_argument(
+            g,
+            flag_name="--router-decode-admission-cap",
+            env_var="DYN_ROUTER_DECODE_ADMISSION_CAP",
+            default=None,
+            help=(
+                "Per-worker in-flight request cap for decode (and aggregated) worker "
+                "selection with least-loaded or power-of-two routing. Only workers below "
+                "the cap are eligible; when every worker is at the cap the request waits in "
+                "a strict-FIFO router queue (or is rejected, see "
+                "--router-decode-admission-policy). The wait is charged to time to first "
+                "token. Prefill selection and pinned targets bypass the cap. Unset keeps "
+                "stock behavior."
+            ),
+            arg_type=nullable_int,
+            dest="decode_admission_cap",
+        )
+        add_argument(
+            g,
+            flag_name="--router-decode-admission-policy",
+            env_var="DYN_ROUTER_DECODE_ADMISSION_POLICY",
+            default="wait",
+            help=(
+                "What to do when every decode worker is at --router-decode-admission-cap: "
+                "wait (FIFO queue) or reject (ResourceExhausted)."
+            ),
+            choices=("wait", "reject"),
+            dest="decode_admission_policy",
+        )
+        add_argument(
+            g,
+            flag_name="--router-decode-admission-max-wait-secs",
+            env_var="DYN_ROUTER_DECODE_ADMISSION_MAX_WAIT_SECS",
+            default=None,
+            help=(
+                "Optional upper bound on the decode admission queue wait; a request that "
+                "waits longer fails with ResourceExhausted. Unset waits until admitted or "
+                "the client disconnects."
+            ),
+            arg_type=nullable_float,
+            dest="decode_admission_max_wait_secs",
         )
         add_argument(
             g,

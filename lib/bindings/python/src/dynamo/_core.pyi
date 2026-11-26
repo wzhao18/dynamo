@@ -1717,6 +1717,9 @@ class RouterConfig:
         enforce_disagg: bool = False,
         session_affinity_ttl_secs: Optional[int] = None,
         session_affinity_mode: str = "hard",
+        decode_admission_cap: Optional[int] = None,
+        decode_admission_policy: str = "wait",
+        decode_admission_max_wait_secs: Optional[float] = None,
     ) -> None:
         """
         Create a RouterConfig.
@@ -1730,6 +1733,11 @@ class RouterConfig:
             enforce_disagg: Deprecated and ignored. Routing topology and readiness come from registered worker types.
             session_affinity_ttl_secs: Router-local session-affinity idle TTL in seconds.
             session_affinity_mode: Session binding behavior: ``hard`` or ``soft``.
+            decode_admission_cap: Per-worker in-flight cap for decode/aggregated selection
+                (least-loaded and power-of-two only). Unset keeps stock behavior.
+            decode_admission_policy: ``wait`` (strict FIFO router queue) or ``reject`` when
+                every decode worker is at the cap.
+            decode_admission_max_wait_secs: Optional upper bound on the queue wait.
         """
         ...
 

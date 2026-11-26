@@ -277,6 +277,109 @@ where
         }
     }
 
+    /// [`Self::select_hosted_worker`] behind the optional decode admission cap.
+    ///
+    /// With a cap configured, the decode / aggregated hop of an occupancy policy
+    /// takes only workers below the cap and otherwise waits in the router's FIFO.
+    /// The wait sits before dispatch, so it is charged to time-to-first-token and
+    /// never co-schedules a decode step. Prefill and pinned targets bypass it.
+    pub(super) async fn select_hosted_worker_admitted(
+        &self,
+        request: &SingleIn<PreprocessedRequest>,
+        phase: RequestPhase,
+        staged_kv: StagedKv,
+        budget: &CleanupBudget,
+        target_constraint: Option<AffinityTarget>,
+        affinity_target: Option<AffinityTarget>,
+    ) -> Result<HostedSelection, Error> {
+        let (selector, occupancy, admission) = match (&self.policy, &self.hosted_occupancy) {
+            (RoutingPolicy::Builtin(selector), Some(occupancy))
+                if phase != RequestPhase::Prefill
+                    && target_constraint.is_none()
+                    && affinity_target.is_none()
+                    && occupancy.admission().is_some() =>
+            {
+                (
+                    selector,
+                    occupancy,
+                    occupancy.admission().expect("checked above"),
+                )
+            }
+            _ => return self.select_hosted_worker(request, target_constraint, affinity_target),
+        };
+        let request_context = request.context();
+        let started = std::time::Instant::now();
+        let wait = async {
+            let admitted = occupancy.select_and_reserve_admitted(&self.inner, selector, admission);
+            match admission.max_wait_secs {
+                Some(max_wait) => tokio::time::timeout(Duration::from_secs_f64(max_wait), admitted)
+                    .await
+                    .unwrap_or_else(|_| {
+                        Err(anyhow::anyhow!(
+                            DynamoError::builder()
+                                .error_type(ErrorType::ResourceExhausted)
+                                .message(format!(
+                                    "decode admission wait exceeded {max_wait} s (cap {})",
+                                    admission.cap
+                                ))
+                                .build()
+                        ))
+                    }),
+                None => admitted.await,
+            }
+        };
+        let result = await_with_cleanup_policy(
+            request_context.as_ref(),
+            phase,
+            staged_kv,
+            "builtin.admission_wait",
+            budget,
+            wait,
+        )
+        .await
+        .and_then(|result| result);
+        let (selection, outcome) = match result {
+            Ok(admitted) => admitted,
+            Err(error) => {
+                tracing::info!(
+                    request_id = %request_context.id(),
+                    cap = admission.cap,
+                    wait_ms = started.elapsed().as_secs_f64() * 1e3,
+                    cancelled = is_cancelled(&error),
+                    error = %error,
+                    "Admission queue left without a worker"
+                );
+                return Err(error);
+            }
+        };
+        if outcome.queued {
+            tracing::info!(
+                request_id = %request_context.id(),
+                worker_id = selection.worker_id,
+                cap = admission.cap,
+                wait_ms = outcome.wait.as_secs_f64() * 1e3,
+                queue_depth_at_enqueue = outcome.queue_depth_at_enqueue,
+                queue_depth_after = outcome.queue_depth_after,
+                "Admission queue granted"
+            );
+        } else {
+            tracing::debug!(
+                request_id = %request_context.id(),
+                worker_id = selection.worker_id,
+                cap = admission.cap,
+                "Admission granted without queueing"
+            );
+        }
+        Ok(HostedSelection {
+            initial_worker: selection.worker_id,
+            target_constraint,
+            occupancy_reservation: Some(selection.reservation),
+            candidate_count: selection.candidate_count,
+            selected_occupancy: Some(selection.occupancy),
+            device_aware_telemetry: None,
+        })
+    }
+
     pub(super) async fn select_and_dispatch_builtin<M, F>(
         &self,
         mut request: SingleIn<PreprocessedRequest>,
@@ -334,7 +437,14 @@ where
                     (None, SessionAffinityMode::Soft) => target,
                     _ => None,
                 };
-                ready(self.select_hosted_worker(&request, pinned_target, affinity_target))
+                self.select_hosted_worker_admitted(
+                    &request,
+                    phase,
+                    staged_kv,
+                    &budget,
+                    pinned_target,
+                    affinity_target,
+                )
             })
             .await?
         };

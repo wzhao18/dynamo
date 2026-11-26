@@ -680,6 +680,7 @@ where
                         uses_multimodal_cache_routing(card),
                         router_config.session_affinity_ttl_secs,
                         router_config.session_affinity_mode,
+                        router_config.decode_admission,
                     )
                     .await
                     .context("build_preprocessed_routing")?,

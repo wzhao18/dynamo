@@ -3065,3 +3065,297 @@ async fn explicit_worker_disappearing_after_preview_is_not_revalidated() {
     drop(host);
     runtime.shutdown();
 }
+
+async fn least_loaded_admission_host(
+    namespace: &str,
+    workers: Vec<u64>,
+    admission: crate::entrypoint::DecodeAdmissionConfig,
+) -> (Runtime, RoutingHost<DefaultWorkerSelector>) {
+    let runtime = Runtime::from_current().unwrap();
+    let distributed = DistributedRuntime::new(runtime.clone(), DistributedConfig::process_local())
+        .await
+        .unwrap();
+    let endpoint = distributed
+        .namespace(namespace.to_string())
+        .unwrap()
+        .component("workers".to_string())
+        .unwrap()
+        .endpoint("generate".to_string());
+    let client = endpoint.client().await.unwrap();
+    let load_context = test_load_context(&client).await;
+    let inner = PushRouter::from_client(client.clone(), RouterMode::LeastLoaded)
+        .await
+        .unwrap();
+    client.override_discovered_instances(workers.clone());
+    client.override_instance_avail(workers);
+    let host = RoutingHost::<DefaultWorkerSelector>::new_builtin(inner, load_context)
+        .unwrap()
+        .with_decode_admission(Some(admission))
+        .unwrap();
+    (runtime, host)
+}
+
+fn cap1() -> crate::entrypoint::DecodeAdmissionConfig {
+    crate::entrypoint::DecodeAdmissionConfig {
+        cap: 1,
+        policy: crate::entrypoint::DecodeAdmissionPolicy::Wait,
+        max_wait_secs: None,
+    }
+}
+
+#[tokio::test]
+async fn decode_admission_cap_queues_decode_fifo_and_bypasses_prefill() {
+    use futures::FutureExt;
+    let (runtime, host) = least_loaded_admission_host("admcap-fifo", vec![1, 2], cap1()).await;
+    let budget = CleanupBudget::default();
+    let select = |phase| {
+        let request = Context::new(request());
+        let host = &host;
+        let budget = &budget;
+        async move {
+            host.select_hosted_worker_admitted(
+                &request,
+                phase,
+                StagedKv::Absent,
+                budget,
+                None,
+                None,
+            )
+            .await
+        }
+    };
+
+    let first = select(RequestPhase::Decode).await.unwrap();
+    let second = select(RequestPhase::Decode).await.unwrap();
+    let mut busy = [first.initial_worker, second.initial_worker];
+    busy.sort();
+    assert_eq!(busy, [1, 2]);
+
+    // Every decode is at the cap: the third and fourth decode requests queue in order.
+    let mut third = Box::pin(select(RequestPhase::Decode));
+    assert!((&mut third).now_or_never().is_none());
+    let mut fourth = Box::pin(select(RequestPhase::Decode));
+    assert!((&mut fourth).now_or_never().is_none());
+    assert_eq!(host.admission_queue_depth_for_test(), 2);
+
+    // Prefill selection is never capped.
+    let prefill = select(RequestPhase::Prefill).await.unwrap();
+    assert_eq!(host.admission_queue_depth_for_test(), 2);
+    drop(prefill);
+
+    // Stream end (guard release) wakes the head of the queue, which takes the freed decode.
+    let freed = second.initial_worker;
+    drop(second);
+    let third = tokio::time::timeout(Duration::from_secs(5), third)
+        .await
+        .expect("head waiter admitted on release")
+        .unwrap();
+    assert_eq!(third.initial_worker, freed);
+    assert!((&mut fourth).now_or_never().is_none());
+    assert_eq!(host.inner.occupancy_for_test(freed), 1);
+
+    let freed = first.initial_worker;
+    drop(first);
+    let fourth = tokio::time::timeout(Duration::from_secs(5), fourth)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(fourth.initial_worker, freed);
+    assert_eq!(host.admission_queue_depth_for_test(), 0);
+
+    drop((third, fourth));
+    drop(host);
+    runtime.shutdown();
+}
+
+#[tokio::test]
+async fn decode_admission_disconnect_leaves_queue_and_passes_the_slot_on() {
+    use futures::FutureExt;
+    let (runtime, host) = least_loaded_admission_host("admcap-cancel", vec![1], cap1()).await;
+    let budget = CleanupBudget::default();
+    let held = host
+        .select_hosted_worker_admitted(
+            &Context::new(request()),
+            RequestPhase::Decode,
+            StagedKv::Absent,
+            &budget,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+    let disconnecting = Context::new(request());
+    let controller = disconnecting.context();
+    let mut cancelled = Box::pin(host.select_hosted_worker_admitted(
+        &disconnecting,
+        RequestPhase::Decode,
+        StagedKv::Absent,
+        &budget,
+        None,
+        None,
+    ));
+    assert!((&mut cancelled).now_or_never().is_none());
+    let waiting = Context::new(request());
+    let mut next = Box::pin(host.select_hosted_worker_admitted(
+        &waiting,
+        RequestPhase::Decode,
+        StagedKv::Absent,
+        &budget,
+        None,
+        None,
+    ));
+    assert!((&mut next).now_or_never().is_none());
+    assert_eq!(host.admission_queue_depth_for_test(), 2);
+
+    // Client disconnect while queued: the request fails as cancelled and leaves the queue.
+    controller.stop_generating();
+    let error = tokio::time::timeout(Duration::from_secs(5), cancelled)
+        .await
+        .unwrap()
+        .err()
+        .expect("disconnected waiter must not be admitted");
+    assert!(is_cancelled(&error), "{error:#}");
+    assert_eq!(host.admission_queue_depth_for_test(), 1);
+
+    drop(held);
+    let admitted = tokio::time::timeout(Duration::from_secs(5), next)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(admitted.initial_worker, 1);
+
+    drop(admitted);
+    drop(host);
+    runtime.shutdown();
+}
+
+#[tokio::test]
+async fn decode_admission_max_wait_and_reject_are_resource_exhausted() {
+    let admission = crate::entrypoint::DecodeAdmissionConfig {
+        max_wait_secs: Some(0.05),
+        ..cap1()
+    };
+    let (runtime, host) = least_loaded_admission_host("admcap-timeout", vec![1], admission).await;
+    let budget = CleanupBudget::default();
+    let select = || {
+        let request = Context::new(request());
+        let host = &host;
+        let budget = &budget;
+        async move {
+            host.select_hosted_worker_admitted(
+                &request,
+                RequestPhase::Decode,
+                StagedKv::Absent,
+                budget,
+                None,
+                None,
+            )
+            .await
+        }
+    };
+    let held = select().await.unwrap();
+    let error = select().await.err().expect("timeout");
+    assert!(match_error_chain(
+        error.as_ref(),
+        &[ErrorType::ResourceExhausted],
+        &[]
+    ));
+    assert_eq!(host.admission_queue_depth_for_test(), 0);
+    drop(held);
+    drop(host);
+    runtime.shutdown();
+
+    let admission = crate::entrypoint::DecodeAdmissionConfig {
+        policy: crate::entrypoint::DecodeAdmissionPolicy::Reject,
+        ..cap1()
+    };
+    let (runtime, host) = least_loaded_admission_host("admcap-reject", vec![1], admission).await;
+    let budget = CleanupBudget::default();
+    let request_a = Context::new(request());
+    let held = host
+        .select_hosted_worker_admitted(
+            &request_a,
+            RequestPhase::Decode,
+            StagedKv::Absent,
+            &budget,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+    let request_b = Context::new(request());
+    let error = host
+        .select_hosted_worker_admitted(
+            &request_b,
+            RequestPhase::Decode,
+            StagedKv::Absent,
+            &budget,
+            None,
+            None,
+        )
+        .await
+        .err()
+        .expect("reject");
+    assert!(match_error_chain(
+        error.as_ref(),
+        &[ErrorType::ResourceExhausted],
+        &[]
+    ));
+    drop(held);
+    drop(host);
+    runtime.shutdown();
+}
+
+#[tokio::test]
+async fn decode_admission_requires_an_occupancy_policy() {
+    let runtime = Runtime::from_current().unwrap();
+    let distributed = DistributedRuntime::new(runtime.clone(), DistributedConfig::process_local())
+        .await
+        .unwrap();
+    let endpoint = distributed
+        .namespace("admcap-rr".to_string())
+        .unwrap()
+        .component("workers".to_string())
+        .unwrap()
+        .endpoint("generate".to_string());
+    let client = endpoint.client().await.unwrap();
+    let load_context = test_load_context(&client).await;
+    let inner = PushRouter::from_client(client, RouterMode::RoundRobin)
+        .await
+        .unwrap();
+    let host = RoutingHost::<DefaultWorkerSelector>::new_builtin(inner, load_context).unwrap();
+    assert!(host.with_decode_admission(Some(cap1())).is_err());
+    runtime.shutdown();
+}
+
+#[test]
+fn decode_admission_config_round_trips_and_defaults_off() {
+    let config: crate::entrypoint::RouterConfig = serde_json::from_str(
+        r#"{"router_mode":"LeastLoaded","kv_router_config":{},"load_threshold_config":{}}"#,
+    )
+    .unwrap_or_default();
+    assert!(config.decode_admission.is_none());
+    let admission: crate::entrypoint::DecodeAdmissionConfig =
+        serde_json::from_str(r#"{"cap":1}"#).unwrap();
+    assert_eq!(
+        admission.policy,
+        crate::entrypoint::DecodeAdmissionPolicy::Wait
+    );
+    assert!(admission.validate().is_ok());
+    assert!(
+        crate::entrypoint::DecodeAdmissionConfig {
+            cap: 0,
+            ..admission
+        }
+        .validate()
+        .is_err()
+    );
+    let reject: crate::entrypoint::DecodeAdmissionConfig =
+        serde_json::from_str(r#"{"cap":2,"policy":"reject","max_wait_secs":1.5}"#).unwrap();
+    assert_eq!(
+        reject.policy,
+        crate::entrypoint::DecodeAdmissionPolicy::Reject
+    );
+    assert_eq!(reject.max_wait_secs, Some(1.5));
+}

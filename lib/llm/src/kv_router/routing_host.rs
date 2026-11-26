@@ -1,12 +1,7 @@
 // SPDX-FileCopyrightText: Copyright (c) 2024-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-use std::{
-    collections::HashSet,
-    future::{Future, ready},
-    sync::Arc,
-    time::Duration,
-};
+use std::{collections::HashSet, future::Future, sync::Arc, time::Duration};
 
 use dynamo_kv_router::{
     protocols::{TokensWithHashes, WorkerConfigLike, WorkerWithDpRank},
@@ -525,6 +520,45 @@ where
                 }),
             routing_context: Some(load_context),
         })
+    }
+
+    /// Install the optional decode admission cap (see [`crate::entrypoint::DecodeAdmissionConfig`]).
+    ///
+    /// Only occupancy-tracking builtin policies (least-loaded, power-of-two) can honour
+    /// a cap; any other policy with a cap configured is a startup error rather than a
+    /// silently ignored setting.
+    pub(crate) fn with_decode_admission(
+        mut self,
+        admission: Option<crate::entrypoint::DecodeAdmissionConfig>,
+    ) -> Result<Self, Error> {
+        let Some(admission) = admission else {
+            return Ok(self);
+        };
+        admission
+            .validate()
+            .map_err(|error| anyhow::anyhow!(error))?;
+        let Some(occupancy) = self.hosted_occupancy.as_mut() else {
+            anyhow::bail!(
+                "decode admission cap requires least-loaded or power-of-two routing, got {:?}",
+                self.inner.router_mode()
+            );
+        };
+        occupancy.set_admission(Some(admission));
+        tracing::info!(
+            endpoint = %self.inner.client.endpoint.id(),
+            cap = admission.cap,
+            policy = ?admission.policy,
+            max_wait_secs = ?admission.max_wait_secs,
+            "decode admission cap enabled"
+        );
+        Ok(self)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn admission_queue_depth_for_test(&self) -> usize {
+        self.hosted_occupancy
+            .as_ref()
+            .map_or(0, |occupancy| occupancy.admission_queue_depth())
     }
 
     pub fn required_worker_inputs(&self) -> WorkerInputs {

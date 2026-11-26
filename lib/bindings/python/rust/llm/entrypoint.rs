@@ -482,13 +482,14 @@ pub struct RouterConfig {
     active_prefill_tokens_threshold_frac: Option<f64>,
     session_affinity_ttl_secs: Option<u64>,
     session_affinity_mode: RsSessionAffinityMode,
+    decode_admission: Option<dynamo_llm::entrypoint::DecodeAdmissionConfig>,
 }
 
 #[pymethods]
 impl RouterConfig {
     #[new]
     #[allow(clippy::too_many_arguments)]
-    #[pyo3(signature = (mode, config=None, active_decode_blocks_threshold=None, active_prefill_tokens_threshold=None, active_prefill_tokens_threshold_frac=None, enforce_disagg=false, session_affinity_ttl_secs=None, session_affinity_mode="hard"))]
+    #[pyo3(signature = (mode, config=None, active_decode_blocks_threshold=None, active_prefill_tokens_threshold=None, active_prefill_tokens_threshold_frac=None, enforce_disagg=false, session_affinity_ttl_secs=None, session_affinity_mode="hard", decode_admission_cap=None, decode_admission_policy="wait", decode_admission_max_wait_secs=None))]
     pub fn new(
         mode: RouterMode,
         config: Option<KvRouterConfig>,
@@ -498,6 +499,9 @@ impl RouterConfig {
         enforce_disagg: bool,
         session_affinity_ttl_secs: Option<u64>,
         session_affinity_mode: &str,
+        decode_admission_cap: Option<u64>,
+        decode_admission_policy: &str,
+        decode_admission_max_wait_secs: Option<f64>,
     ) -> PyResult<Self> {
         if enforce_disagg {
             static WARN_ONCE: std::sync::Once = std::sync::Once::new();
@@ -522,6 +526,27 @@ impl RouterConfig {
         let session_affinity_mode = session_affinity_mode
             .parse()
             .map_err(PyValueError::new_err)?;
+        let decode_admission_policy: dynamo_llm::entrypoint::DecodeAdmissionPolicy =
+            decode_admission_policy
+                .parse()
+                .map_err(PyValueError::new_err)?;
+        let decode_admission = match decode_admission_cap {
+            Some(cap) => {
+                let admission = dynamo_llm::entrypoint::DecodeAdmissionConfig {
+                    cap,
+                    policy: decode_admission_policy,
+                    max_wait_secs: decode_admission_max_wait_secs,
+                };
+                admission.validate().map_err(PyValueError::new_err)?;
+                Some(admission)
+            }
+            None if decode_admission_max_wait_secs.is_some() => {
+                return Err(PyValueError::new_err(
+                    "decode_admission_max_wait_secs requires decode_admission_cap",
+                ));
+            }
+            None => None,
+        };
         Ok(Self {
             router_mode: mode,
             kv_router_config: config.unwrap_or_default(),
@@ -530,6 +555,7 @@ impl RouterConfig {
             active_prefill_tokens_threshold_frac,
             session_affinity_ttl_secs,
             session_affinity_mode,
+            decode_admission,
         })
     }
 }
@@ -547,6 +573,7 @@ impl From<RouterConfig> for RsRouterConfig {
             enforce_disagg: false,
             session_affinity_ttl_secs: rc.session_affinity_ttl_secs,
             session_affinity_mode: rc.session_affinity_mode,
+            decode_admission: rc.decode_admission,
         }
     }
 }

@@ -169,6 +169,7 @@ fn preprocessed_backend_engine<Sel>(
     affinity: Option<AffinityCoordinator>,
     session_affinity_mode: SessionAffinityMode,
     load_context: Arc<RoutingLoadContext>,
+    decode_admission: Option<crate::entrypoint::DecodeAdmissionConfig>,
 ) -> anyhow::Result<Arc<RoutingHost<Sel>>>
 where
     Sel: WorkerSelector<crate::local_model::runtime_config::ModelRuntimeConfig> + Send + 'static,
@@ -187,6 +188,11 @@ where
             let Some(chooser) = chooser else {
                 anyhow::bail!("RouterMode::KV requires KVRouter to not be null");
             };
+            if decode_admission.is_some() {
+                anyhow::bail!(
+                    "decode admission cap requires least-loaded or power-of-two routing, got KV"
+                );
+            }
             Arc::new(RoutingHost::new_with_load_context_and_coordinator(
                 router,
                 chooser,
@@ -199,13 +205,16 @@ where
             let lora = model_manager
                 .lora_filter_for(endpoint_id)
                 .map(|filter| (filter, model_manager.lora_load_estimator_for(endpoint_id)));
-            Arc::new(RoutingHost::<Sel>::new_builtin_with_capabilities(
-                router,
-                load_context,
-                affinity,
-                session_affinity_mode,
-                lora,
-            )?)
+            Arc::new(
+                RoutingHost::<Sel>::new_builtin_with_capabilities(
+                    router,
+                    load_context,
+                    affinity,
+                    session_affinity_mode,
+                    lora,
+                )?
+                .with_decode_admission(decode_admission)?,
+            )
         }
     };
 
@@ -235,6 +244,7 @@ pub async fn build_preprocessed_routing(
         enable_multimodal_cache_indexer,
         session_affinity_ttl_secs,
         SessionAffinityMode::Hard,
+        None,
     )
     .await
 }
@@ -251,6 +261,7 @@ pub(crate) async fn build_preprocessed_routing_with_selector<Sel>(
     enable_multimodal_cache_indexer: bool,
     session_affinity_ttl_secs: Option<u64>,
     session_affinity_mode: SessionAffinityMode,
+    decode_admission: Option<crate::entrypoint::DecodeAdmissionConfig>,
 ) -> anyhow::Result<PreprocessedRouting<Sel>>
 where
     Sel: WorkerSelector<crate::local_model::runtime_config::ModelRuntimeConfig> + Send + 'static,
@@ -319,6 +330,7 @@ where
         affinity,
         session_affinity_mode,
         load_context,
+        decode_admission,
     )?;
     if router_mode.is_kv_routing() && prefill_router.conditional_disagg_enabled() {
         prefill_router
