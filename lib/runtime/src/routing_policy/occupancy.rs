@@ -559,10 +559,10 @@ mod tests {
         let order = Arc::new(parking_lot::Mutex::new(Vec::new()));
         let mut tasks = Vec::new();
         for i in 0..5u32 {
-            let state = Arc::clone(&state);
+            let task_state = Arc::clone(&state);
             let order = Arc::clone(&order);
             tasks.push(tokio::spawn(async move {
-                let (selection, _) = capped(&state, &[1], 1).await.unwrap();
+                let (selection, _) = capped(&task_state, &[1], 1).await.unwrap();
                 order.lock().push(i);
                 selection.into_reservation()
             }));
