@@ -1280,6 +1280,8 @@ fn effective_router_config<'a>(
         .router_decode_policy
         .clone();
     effective.session_affinity_mode = frontend_config.session_affinity_mode;
+    // The admission queue lives in this frontend's router, so the frontend owns its cap.
+    effective.decode_admission = frontend_config.decode_admission;
     Cow::Owned(effective)
 }
 
@@ -2499,6 +2501,29 @@ mod tests {
         );
         assert!(worker.kv_router_config.router_prefill_policy.is_none());
         assert!(worker.kv_router_config.router_decode_policy.is_none());
+    }
+
+    #[test]
+    fn worker_router_config_keeps_the_frontend_decode_admission_cap() {
+        let frontend = RouterConfig {
+            router_mode: RouterMode::LeastLoaded,
+            decode_admission: Some(crate::entrypoint::DecodeAdmissionConfig {
+                cap: 1,
+                policy: crate::entrypoint::DecodeAdmissionPolicy::Wait,
+                max_wait_secs: None,
+            }),
+            ..Default::default()
+        };
+        let worker = RouterConfig {
+            router_mode: RouterMode::LeastLoaded,
+            ..Default::default()
+        };
+        let effective = effective_router_config(Some(&worker), &frontend);
+        assert_eq!(effective.decode_admission, frontend.decode_admission);
+        assert_eq!(
+            effective_router_config(None, &frontend).decode_admission,
+            frontend.decode_admission
+        );
     }
 
     #[tokio::test]
